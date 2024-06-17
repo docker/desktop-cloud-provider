@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"text/template"
 	"time"
@@ -315,19 +314,12 @@ func proxyUpdateLoadBalancer(ctx context.Context, clusterName string, service *v
 }
 
 func waitLoadBalancerReady(ctx context.Context, name string, timeout time.Duration) error {
-	portmaps, err := container.PortMaps(name)
-	if err != nil {
-		return err
-	}
-	port, ok := portmaps[strconv.Itoa(envoyAdminPort)]
-	if !ok {
-		return fmt.Errorf("envoy admin port %d not found, got %v", envoyAdminPort, portmaps)
-	}
-
 	httpClient := http.DefaultClient
-	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, timeout, true, func(ctx context.Context) (done bool, err error) {
+	err := wait.PollUntilContextTimeout(ctx, 1*time.Second, timeout, true, func(ctx context.Context) (done bool, err error) {
 		// iptables port forwarding on localhost only works for IPv4
-		resp, err := httpClient.Get(fmt.Sprintf("http://127.0.0.1:%s/ready", port))
+
+		// we run in a container connected to kind network, so can directly access LB by it's container name and exposed port
+		resp, err := httpClient.Get(fmt.Sprintf("http://%s:%d/ready", name, envoyAdminPort))
 		if err != nil {
 			klog.V(2).Infof("unexpected error trying to get load balancer %s readyness :%v", name, err)
 			return false, nil
