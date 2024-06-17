@@ -25,6 +25,7 @@ import (
 	"sigs.k8s.io/cloud-provider-kind/pkg/loadbalancer"
 	"sigs.k8s.io/cloud-provider-kind/pkg/provider"
 	"sigs.k8s.io/kind/pkg/cluster"
+	"sigs.k8s.io/kind/pkg/cluster/nodeutils"
 	"sigs.k8s.io/kind/pkg/log"
 )
 
@@ -132,6 +133,16 @@ func (c *Controller) getKubeClient(ctx context.Context, cluster string) (kuberne
 			continue
 		}
 
+		// docker provider uses NetworkConfig to retrieve control plane host:port reported by kind.KubeConfig
+		// this is the host:port exposed on docker engine host, i.e localhost:publicPort
+		// We run in a container connected to kind network, we want to access control plane using it's
+		// IP on kind network and can talk to the exposed (target) port
+		config.Host, err = c.getKubeAPIEndpoint(cluster)
+		if err != nil {
+			klog.Errorf("Failed to retrieve kube API enpoint for cluster %s: %v", cluster, err)
+			continue
+		}
+
 		// check that the apiserver is reachable before continue
 		// to fail fast and avoid waiting until the client operations timeout
 		var ok bool
@@ -160,6 +171,27 @@ func (c *Controller) getKubeClient(ctx context.Context, cluster string) (kuberne
 		return kubeClient, err
 	}
 	return nil, fmt.Errorf("can not find a working kubernetes clientset")
+}
+
+func (c *Controller) getKubeAPIEndpoint(cluster string) (string, error) {
+	n, err := c.kind.ListNodes(cluster)
+	if err != nil {
+		klog.Errorf("Failed to list cluster nodes %s: %v", cluster, err)
+		return "", err
+	}
+	nodes, err := nodeutils.ControlPlaneNodes(n)
+	if err != nil {
+		klog.Errorf("Failed to select control-plane node %s: %v", cluster, err)
+		return "", err
+	}
+	ipv4, _, err := nodes[0].IP()
+	if err != nil {
+		klog.Errorf("Failed to retrieve control-plane IP %s: %v", cluster, err)
+		return "", err
+	}
+
+	// common.APIServerInternalPort is internal
+	return fmt.Sprintf("https://%s:%d", ipv4, 6443), nil
 }
 
 func probeHTTP(client *http.Client, address string) bool {

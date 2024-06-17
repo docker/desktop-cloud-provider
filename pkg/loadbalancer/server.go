@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"path"
-	"runtime"
 	"strings"
 
 	v1 "k8s.io/api/core/v1"
@@ -22,17 +21,12 @@ import (
 )
 
 type Server struct {
-	tunnelManager *tunnelManager
 }
 
 var _ cloudprovider.LoadBalancer = &Server{}
 
 func NewServer() cloudprovider.LoadBalancer {
-	s := &Server{}
-	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
-		s.tunnelManager = NewTunnelManager()
-	}
-	return s
+	return &Server{}
 }
 
 func (s *Server) GetLoadBalancer(ctx context.Context, clusterName string, service *v1.Service) (*v1.LoadBalancerStatus, bool, error) {
@@ -115,15 +109,6 @@ func (s *Server) EnsureLoadBalancer(ctx context.Context, clusterName string, ser
 		return nil, err
 	}
 
-	// on some platforms that run containers in VMs forward from userspace
-	if s.tunnelManager != nil {
-		klog.V(2).Infof("updating loadbalancer tunnels on userspace")
-		err = s.tunnelManager.setupTunnels(loadBalancerName(clusterName, service))
-		if err != nil {
-			return nil, err
-		}
-	}
-
 	// get loadbalancer Status
 	klog.V(2).Infof("get loadbalancer status")
 	status, ok, err := s.GetLoadBalancer(ctx, clusterName, service)
@@ -143,9 +128,6 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, clusterName string, ser
 func (s *Server) EnsureLoadBalancerDeleted(ctx context.Context, clusterName string, service *v1.Service) error {
 	containerName := loadBalancerName(clusterName, service)
 	var err1, err2 error
-	if s.tunnelManager != nil {
-		err1 = s.tunnelManager.removeTunnels(containerName)
-	}
 	// Before deleting the load balancer store the logs if required
 	if config.DefaultConfig.EnableLogDump {
 		fileName := path.Join(config.DefaultConfig.LogDir, service.Namespace+"_"+service.Name+".log")
@@ -201,33 +183,16 @@ func (s *Server) createLoadBalancer(clusterName string, service *v1.Service, ima
 		"--net", networkName,
 		"--init=false",
 		"--hostname", name, // make hostname match container name
-		// label the node with the role ID
-		// running containers in a container requires privileged
-		// NOTE: we could try to replicate this with --cap-add, and use less
-		// privileges, but this flag also changes some mounts that are necessary
-		// including some ones docker would otherwise do by default.
-		// for now this is what we want. in the future we may revisit this.
-		"--privileged",
-		"--restart=on-failure",                      // to deal with the crash casued by https://github.com/envoyproxy/envoy/issues/34195
-		"--sysctl=net.ipv4.ip_forward=1",            // allow ip forwarding
-		"--sysctl=net.ipv6.conf.all.disable_ipv6=0", // enable IPv6
-		"--sysctl=net.ipv6.conf.all.forwarding=1",   // allow ipv6 forwarding
-		"--sysctl=net.ipv4.conf.all.rp_filter=0",    // disable rp filter
+		"--restart=on-failure", // to deal with the crash casued by https://github.com/envoyproxy/envoy/issues/34195
 	}
 
-	if s.tunnelManager != nil {
-		// Forward the Service Ports to the host so they are accessible on Mac and Windows
-		for _, port := range service.Spec.Ports {
-			if port.Protocol != v1.ProtocolTCP && port.Protocol != v1.ProtocolUDP {
-				continue
-			}
-			args = append(args, fmt.Sprintf("--publish=%d/%s", port.Port, port.Protocol))
+	// Forward the Service Ports to the host so they are accessible on Mac and Windows
+	for _, port := range service.Spec.Ports {
+		if port.Protocol != v1.ProtocolTCP && port.Protocol != v1.ProtocolUDP {
+			continue
 		}
+		args = append(args, fmt.Sprintf("--publish=%d:%d/%s", port.Port, port.Port, port.Protocol))
 	}
-	// publish the admin endpoint
-	args = append(args, fmt.Sprintf("--publish=%d/%s", envoyAdminPort, v1.ProtocolTCP))
-	// Publish all ports in the host in random ports
-	args = append(args, "--publish-all")
 
 	args = append(args, image)
 	// we need to override the default envoy configuration
@@ -243,7 +208,7 @@ func (s *Server) createLoadBalancer(clusterName string, service *v1.Service, ima
 	klog.V(2).Infof("creating loadbalancer with parameters: %v", args)
 	err := container.Create(name, args)
 	if err != nil {
-		return fmt.Errorf("failed to create continers %s %v: %w", name, args, err)
+		return fmt.Errorf("failed to create containers %s %v: %w", name, args, err)
 	}
 
 	return nil
