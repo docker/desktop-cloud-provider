@@ -4,12 +4,18 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base32"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"path"
+	"strconv"
 	"strings"
 
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/api/types/strslice"
+	"github.com/docker/docker/errdefs"
+	"github.com/docker/go-connections/nat"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	cloudprovider "k8s.io/cloud-provider"
@@ -17,7 +23,7 @@ import (
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/cloud-provider-kind/pkg/config"
 	"sigs.k8s.io/cloud-provider-kind/pkg/constants"
-	"sigs.k8s.io/cloud-provider-kind/pkg/container"
+	"sigs.k8s.io/cloud-provider-kind/pkg/moby"
 )
 
 type Server struct {
@@ -32,7 +38,7 @@ func NewServer() cloudprovider.LoadBalancer {
 func (s *Server) GetLoadBalancer(ctx context.Context, clusterName string, service *v1.Service) (*v1.LoadBalancerStatus, bool, error) {
 	// report status
 	name := loadBalancerName(clusterName, service)
-	ipv4, ipv6, err := container.IPs(name)
+	ipv4, ipv6, err := moby.IPs(ctx, name)
 	if err != nil {
 		if strings.Contains(err.Error(), "failed to get container details") {
 			return nil, false, nil
@@ -85,28 +91,36 @@ func (s *Server) GetLoadBalancerName(ctx context.Context, clusterName string, se
 
 func (s *Server) EnsureLoadBalancer(ctx context.Context, clusterName string, service *v1.Service, nodes []*v1.Node) (*v1.LoadBalancerStatus, error) {
 	name := loadBalancerName(clusterName, service)
-	if !container.IsRunning(name) {
+	running, err := moby.IsRunning(ctx, name)
+	klog.V(2).Infof("checked loadbalancer is running %t %s", running, err)
+	exists := true
+	if errdefs.IsNotFound(err) {
+		exists = false
+	} else if err != nil {
+		return nil, err
+	} else if err == nil && !running {
 		klog.Infof("container %s for loadbalancer is not running", name)
-		if container.Exist(name) {
-			err := container.Delete(name)
-			if err != nil {
-				return nil, err
-			}
-		}
-	}
-	if !container.Exist(name) {
-		klog.V(2).Infof("creating container for loadbalancer")
-		err := s.createLoadBalancer(clusterName, service, proxyImage)
+		err := moby.Delete(ctx, name)
 		if err != nil {
 			return nil, err
 		}
+		exists = false
 	}
 
-	// update loadbalancer
-	klog.V(2).Infof("updating loadbalancer")
-	err := s.UpdateLoadBalancer(ctx, clusterName, service, nodes)
-	if err != nil {
-		return nil, err
+	if !exists {
+		klog.V(2).Infof("creating container for loadbalancer")
+
+		err := s.createLoadBalancer(ctx, clusterName, service, nodes, proxyImage)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		// update loadbalancer
+		klog.V(2).Infof("updating loadbalancer")
+		err = s.UpdateLoadBalancer(ctx, clusterName, service, nodes)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// get loadbalancer Status
@@ -115,10 +129,7 @@ func (s *Server) EnsureLoadBalancer(ctx context.Context, clusterName string, ser
 	if !ok {
 		return nil, fmt.Errorf("loadbalancer %s not found", name)
 	}
-	if err != nil {
-		return nil, err
-	}
-	return status, nil
+	return status, err
 }
 
 func (s *Server) UpdateLoadBalancer(ctx context.Context, clusterName string, service *v1.Service, nodes []*v1.Node) error {
@@ -132,11 +143,11 @@ func (s *Server) EnsureLoadBalancerDeleted(ctx context.Context, clusterName stri
 	if config.DefaultConfig.EnableLogDump {
 		fileName := path.Join(config.DefaultConfig.LogDir, service.Namespace+"_"+service.Name+".log")
 		klog.V(2).Infof("storing logs for loadbalancer %s on %s", containerName, fileName)
-		if err := container.LogDump(containerName, fileName); err != nil {
+		if err := moby.LogDump(ctx, containerName, fileName); err != nil {
 			klog.Infof("error trying to store logs for load balancer %s : %v", containerName, err)
 		}
 	}
-	err2 = container.Delete(containerName)
+	err2 = moby.Delete(ctx, containerName)
 	return errors.Join(err1, err2)
 }
 
@@ -164,52 +175,84 @@ func ServiceFromLoadBalancerSimpleName(s string) (clusterName string, service *v
 }
 
 // createLoadBalancer create a docker container with a loadbalancer
-func (s *Server) createLoadBalancer(clusterName string, service *v1.Service, image string) error {
+func (s *Server) createLoadBalancer(ctx context.Context, clusterName string, service *v1.Service, nodes []*v1.Node, image string) error {
 	name := loadBalancerName(clusterName, service)
-
 	networkName := constants.FixedNetworkName
-	if n := os.Getenv("KIND_EXPERIMENTAL_DOCKER_NETWORK"); n != "" {
-		networkName = n
-	}
 
-	args := []string{
-		"--detach", // run the container detached
-		"--tty",    // allocate a tty for entrypoint logs
-		// label the node with the cluster ID
-		"--label", fmt.Sprintf("%s=%s", constants.NodeCCMLabelKey, clusterName),
-		// label the node with the load balancer name
-		"--label", fmt.Sprintf("%s=%s", constants.LoadBalancerNameLabelKey, loadBalancerSimpleName(clusterName, service)),
-		// user a user defined docker network so we get embedded DNS
-		"--net", networkName,
-		"--init=false",
-		"--hostname", name, // make hostname match container name
-		"--restart=on-failure", // to deal with the crash casued by https://github.com/envoyproxy/envoy/issues/34195
-	}
-
+	portBinding := map[nat.Port][]nat.PortBinding{}
+	exposed := map[nat.Port]struct{}{}
 	// Forward the Service Ports to the host so they are accessible on Mac and Windows
 	for _, port := range service.Spec.Ports {
 		if port.Protocol != v1.ProtocolTCP && port.Protocol != v1.ProtocolUDP {
 			continue
 		}
-		args = append(args, fmt.Sprintf("--publish=%d:%d/%s", port.Port, port.Port, port.Protocol))
+
+		p := nat.Port(fmt.Sprintf("%d/%s", port.Port, port.Protocol))
+		portBinding[p] = []nat.PortBinding{
+			{
+				HostPort: strconv.Itoa(int(port.Port)),
+			},
+		}
+		exposed[p] = struct{}{}
 	}
 
-	args = append(args, image)
-	// we need to override the default envoy configuration
-	// https://www.envoyproxy.io/docs/envoy/latest/start/quick-start/configuration-dynamic-filesystem
-	// envoy crashes in some circumstances, causing the container to restart, the problem is that the container
-	// may come with a different IP and we don't update the status, we may do it, but applications does not use
-	// to handle that the assigned LoadBalancerIP changes.
-	// https://github.com/envoyproxy/envoy/issues/34195
-	cmd := []string{"bash", "-c",
-		fmt.Sprintf(`echo -en '%s' > %s && touch %s && touch %s && while true; do envoy -c %s && break; sleep 1; done`,
-			dynamicFilesystemConfig, proxyConfigPath, proxyConfigPathCDS, proxyConfigPathLDS, proxyConfigPath)}
-	args = append(args, cmd...)
-	klog.V(2).Infof("creating loadbalancer with parameters: %v", args)
-	err := container.Create(name, args)
+	config := &container.Config{
+		Tty:   true,
+		Image: image,
+		Labels: map[string]string{
+			constants.NodeCCMLabelKey:          clusterName,
+			constants.LoadBalancerNameLabelKey: loadBalancerSimpleName(clusterName, service),
+		},
+		Hostname: name,
+		Cmd: strslice.StrSlice{
+			"bash", "-c",
+			// we need to override the default envoy configuration
+			// https://www.envoyproxy.io/docs/envoy/latest/start/quick-start/configuration-dynamic-filesystem
+			// envoy crashes in some circumstances, causing the container to restart, the problem is that the container
+			// may come with a different IP and we don't update the status, we may do it, but applications does not use
+			// to handle that the assigned LoadBalancerIP changes.
+			// https://github.com/envoyproxy/envoy/issues/34195
+
+			fmt.Sprintf(`while true; do envoy -c %s && break; sleep 1; done`, proxyConfigPath),
+		},
+		ExposedPorts: exposed,
+	}
+
+	host := &container.HostConfig{
+		NetworkMode:   container.NetworkMode(networkName),
+		RestartPolicy: container.RestartPolicy{Name: container.RestartPolicyOnFailure},
+		PortBindings:  portBinding,
+	}
+
+	net := &network.NetworkingConfig{
+		EndpointsConfig: map[string]*network.EndpointSettings{
+			networkName: {},
+		},
+	}
+
+	c, _ := json.Marshal(config)
+	n, _ := json.Marshal(net)
+	h, _ := json.Marshal(host)
+
+	klog.V(2).Infof("creating loadbalancer %s %s %s", string(c), string(n), string(h))
+	var id, err = moby.Create(ctx, name, config, net, host)
 	if err != nil {
-		return fmt.Errorf("failed to create containers %s %v: %w", name, args, err)
+		return fmt.Errorf("failed to create containers %s: %w", name, err)
 	}
 
-	return nil
+	ldsConfig, cdsConfig, err := generateConfig(service, nodes)
+	if err != nil {
+		return err
+	}
+
+	err = moby.Copy(ctx, id, map[string][]byte{
+		proxyConfigPath:    []byte(dynamicFilesystemConfig),
+		proxyConfigPathLDS: []byte(ldsConfig),
+		proxyConfigPathCDS: []byte(cdsConfig),
+	})
+	if err != nil {
+		return err
+	}
+
+	return moby.Start(ctx, id)
 }

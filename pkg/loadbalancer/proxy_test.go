@@ -298,17 +298,17 @@ func Test_generateConfig(t *testing.T) {
 					},
 				},
 				SourceRanges: []sourceRange{
-					{ Prefix: "10.0.0.0", Length: 8},
-					{ Prefix: "192.168.0.0", Length: 16},
+					{Prefix: "10.0.0.0", Length: 8},
+					{Prefix: "192.168.0.0", Length: 16},
 				},
 			},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := generateConfig(tt.service, tt.nodes); !reflect.DeepEqual(got, tt.want) {
+			if got := generateConfigData(tt.service, tt.nodes); !reflect.DeepEqual(got, tt.want) {
 				t.Logf("diff %+v", cmp.Diff(got, tt.want))
-				t.Errorf("generateConfig() = %+v,\n want %+v", got, tt.want)
+				t.Errorf("generateConfigData() = %+v,\n want %+v", got, tt.want)
 			}
 		})
 	}
@@ -574,8 +574,8 @@ func Test_proxyConfig(t *testing.T) {
 					},
 				},
 				SourceRanges: []sourceRange{
-					{ Prefix: "10.0.0.0", Length: 8},
-					{ Prefix: "192.168.0.0", Length: 16},
+					{Prefix: "10.0.0.0", Length: 8},
+					{Prefix: "192.168.0.0", Length: 16},
 				},
 			},
 			wantConfig: `

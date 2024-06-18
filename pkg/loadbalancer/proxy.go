@@ -16,7 +16,7 @@ import (
 	"k8s.io/klog/v2"
 	netutils "k8s.io/utils/net"
 
-	"sigs.k8s.io/cloud-provider-kind/pkg/container"
+	"sigs.k8s.io/cloud-provider-kind/pkg/moby"
 )
 
 // proxyImage defines the loadbalancer image:tag
@@ -201,7 +201,21 @@ func proxyConfig(configTemplate string, data *proxyConfigData) (config string, e
 	return buff.String(), nil
 }
 
-func generateConfig(service *v1.Service, nodes []*v1.Node) *proxyConfigData {
+func generateConfig(service *v1.Service, nodes []*v1.Node) (string, string, error) {
+	config := generateConfigData(service, nodes)
+	ldsConfig, err := proxyConfig(proxyLDSConfigTemplate, config)
+	if err != nil {
+		return "", "", errors.Wrap(err, "failed to generate loadbalancer config data")
+	}
+
+	cdsConfig, err := proxyConfig(proxyCDSConfigTemplate, config)
+	if err != nil {
+		return "", "", errors.Wrap(err, "failed to generate loadbalancer config data")
+	}
+	return ldsConfig, cdsConfig, nil
+}
+
+func generateConfigData(service *v1.Service, nodes []*v1.Node) *proxyConfigData {
 	if service == nil {
 		return nil
 	}
@@ -277,38 +291,20 @@ func proxyUpdateLoadBalancer(ctx context.Context, clusterName string, service *v
 	if service == nil {
 		return nil
 	}
-	var stdout, stderr bytes.Buffer
 	name := loadBalancerName(clusterName, service)
-	config := generateConfig(service, nodes)
 	// create loadbalancer config data
-	ldsConfig, err := proxyConfig(proxyLDSConfigTemplate, config)
+	ldsConfig, cdsConfig, err := generateConfig(service, nodes)
 	if err != nil {
 		return errors.Wrap(err, "failed to generate loadbalancer config data")
 	}
 
 	klog.V(2).Infof("updating loadbalancer with config %s", ldsConfig)
-	err = container.Exec(name, []string{"cp", "/dev/stdin", proxyConfigPathLDS + ".tmp"}, strings.NewReader(ldsConfig), &stdout, &stderr)
+	err = moby.Copy(ctx, name, map[string][]byte{
+		proxyConfigPathLDS: []byte(ldsConfig),
+		proxyConfigPathCDS: []byte(cdsConfig),
+	})
 	if err != nil {
 		return err
-	}
-
-	cdsConfig, err := proxyConfig(proxyCDSConfigTemplate, config)
-	if err != nil {
-		return errors.Wrap(err, "failed to generate loadbalancer config data")
-	}
-
-	klog.V(2).Infof("updating loadbalancer with config %s", cdsConfig)
-	err = container.Exec(name, []string{"cp", "/dev/stdin", proxyConfigPathCDS + ".tmp"}, strings.NewReader(cdsConfig), &stdout, &stderr)
-	if err != nil {
-		return err
-	}
-	// envoy has an initialization process until starts to forward traffic
-	// https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/operations/init#arch-overview-initialization
-	// also wait for the healthchecks and "no_traffic_interval"
-	cmd := fmt.Sprintf(`chmod a+rw /home/envoy/* && mv %s %s && mv %s %s`, proxyConfigPathCDS+".tmp", proxyConfigPathCDS, proxyConfigPathLDS+".tmp", proxyConfigPathLDS)
-	err = container.Exec(name, []string{"bash", "-c", cmd}, nil, &stdout, &stderr)
-	if err != nil {
-		return fmt.Errorf("error updating configuration Stdout: %s Stderr: %s : %w", stdout.String(), stderr.String(), err)
 	}
 	return waitLoadBalancerReady(ctx, name, 30*time.Second)
 }

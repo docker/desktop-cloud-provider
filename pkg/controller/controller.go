@@ -21,8 +21,8 @@ import (
 	ccmfeatures "k8s.io/controller-manager/pkg/features"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/cloud-provider-kind/pkg/constants"
-	"sigs.k8s.io/cloud-provider-kind/pkg/container"
 	"sigs.k8s.io/cloud-provider-kind/pkg/loadbalancer"
+	"sigs.k8s.io/cloud-provider-kind/pkg/moby"
 	"sigs.k8s.io/cloud-provider-kind/pkg/provider"
 	"sigs.k8s.io/kind/pkg/cluster"
 	"sigs.k8s.io/kind/pkg/cluster/nodeutils"
@@ -283,7 +283,7 @@ func startCloudControllerManager(ctx context.Context, clusterName string, kubeCl
 	cancelFn := func() {
 		cancel()
 
-		containers, err := container.ListByLabel(fmt.Sprintf("%s=%s", constants.NodeCCMLabelKey, clusterName))
+		containers, err := moby.ListByLabel(ctx, fmt.Sprintf("%s=%s", constants.NodeCCMLabelKey, clusterName))
 		if err != nil {
 			klog.Errorf("can't list containers: %v", err)
 			return
@@ -295,11 +295,11 @@ func startCloudControllerManager(ctx context.Context, clusterName string, kubeCl
 			return
 		}
 
-		for _, name := range containers {
+		for _, container := range containers {
 			// create fake service to pass to the cloud provider method
-			v, err := container.GetLabelValue(name, constants.LoadBalancerNameLabelKey)
-			if err != nil {
-				klog.Infof("could not get the label for the loadbalancer on container %s on cluster %s : %v", name, clusterName, err)
+			v, ok := container.Labels[constants.LoadBalancerNameLabelKey]
+			if !ok {
+				klog.Infof("could not get the label for the loadbalancer on container %s on cluster %s : %v", container.ID, clusterName, err)
 				continue
 			}
 			clusterName, service := loadbalancer.ServiceFromLoadBalancerSimpleName(v)
