@@ -14,7 +14,6 @@ import (
 
 	"sigs.k8s.io/cloud-provider-kind/pkg/config"
 	"sigs.k8s.io/cloud-provider-kind/pkg/controller"
-	kindcmd "sigs.k8s.io/kind/pkg/cmd"
 )
 
 var (
@@ -63,20 +62,7 @@ func Main() {
 		}
 	}()
 
-	// initialize loggers, kind logger and klog
-	logger := kindcmd.NewLogger()
-	type verboser interface {
-		SetVerbosity(int)
-	}
-	v, ok := logger.(verboser)
-	if ok {
-		v.SetVerbosity(flagV)
-	}
-
-	_, err := logs.GlogSetter(strconv.Itoa(flagV))
-	if err != nil {
-		logger.Errorf("error setting klog verbosity to %d : %v", flagV, err)
-	}
+	_, _ = logs.GlogSetter(strconv.Itoa(flagV))
 
 	// initialize log directory
 	if enableLogDump {
@@ -98,5 +84,5 @@ func Main() {
 		klog.Infof("**** Dumping load balancers logs to: %s", logDumpDir)
 	}
 
-	controller.New(logger).Run(ctx)
+	controller.New().Run(ctx)
 }

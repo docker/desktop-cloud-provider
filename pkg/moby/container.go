@@ -114,8 +114,10 @@ func IPs(ctx context.Context, name string) (ipv4 string, ipv6 string, err error)
 	return settings.IPAddress, settings.GlobalIPv6Address, nil
 }
 
-func ListByLabel(ctx context.Context, label string) ([]types.Container, error) {
-	return api.ContainerList(ctx, container.ListOptions{
-		Filters: filters.NewArgs(filters.Arg("label", label)),
-	})
+func ListByLabel(ctx context.Context, label ...string) ([]types.Container, error) {
+	f := filters.NewArgs()
+	for _, label := range label {
+		f.Add("label", label)
+	}
+	return api.ContainerList(ctx, container.ListOptions{Filters: f})
 }

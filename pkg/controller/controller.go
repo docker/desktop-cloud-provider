@@ -24,13 +24,9 @@ import (
 	"sigs.k8s.io/cloud-provider-kind/pkg/loadbalancer"
 	"sigs.k8s.io/cloud-provider-kind/pkg/moby"
 	"sigs.k8s.io/cloud-provider-kind/pkg/provider"
-	"sigs.k8s.io/kind/pkg/cluster"
-	"sigs.k8s.io/kind/pkg/cluster/nodeutils"
-	"sigs.k8s.io/kind/pkg/log"
 )
 
 type Controller struct {
-	kind     *cluster.Provider
 	clusters map[string]*ccm
 }
 
@@ -41,12 +37,9 @@ type ccm struct {
 	cancelFn          context.CancelFunc
 }
 
-func New(logger log.Logger) *Controller {
+func New() *Controller {
 	controllersmetrics.Register()
 	return &Controller{
-		kind: cluster.NewProvider(
-			cluster.ProviderWithLogger(logger),
-		),
 		clusters: make(map[string]*ccm),
 	}
 }
@@ -55,7 +48,7 @@ func (c *Controller) Run(ctx context.Context) {
 	defer c.cleanup()
 	for {
 		// get existing kind clusters
-		clusters, err := c.kind.List()
+		clusters, err := moby.ListClusters(ctx)
 		if err != nil {
 			klog.Infof("error listing clusters, retrying ...: %v", err)
 		}
@@ -82,7 +75,7 @@ func (c *Controller) Run(ctx context.Context) {
 			}
 
 			klog.V(2).Infof("Creating new cloud provider for cluster %s", cluster)
-			cloud := provider.New(cluster, c.kind)
+			cloud := provider.New(cluster)
 			ccm, err := startCloudControllerManager(ctx, cluster, kubeClient, cloud)
 			if err != nil {
 				klog.Errorf("Failed to start cloud controller for cluster %s: %v", cluster, err)
@@ -119,72 +112,62 @@ func (c *Controller) getKubeClient(ctx context.Context, cluster string) (kuberne
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		},
 	}
-	// try internal first
-	for _, internal := range []bool{false, true} {
-		kconfig, err := c.kind.KubeConfig(cluster, internal)
-		if err != nil {
-			klog.Errorf("Failed to get kubeconfig for cluster %s: %v", cluster, err)
-			continue
-		}
-
-		config, err := clientcmd.RESTConfigFromKubeConfig([]byte(kconfig))
-		if err != nil {
-			klog.Errorf("Failed to convert kubeconfig for cluster %s: %v", cluster, err)
-			continue
-		}
-
-		// docker provider uses NetworkConfig to retrieve control plane host:port reported by kind.KubeConfig
-		// this is the host:port exposed on docker engine host, i.e localhost:publicPort
-		// We run in a container connected to kind network, we want to access control plane using it's
-		// IP on kind network and can talk to the exposed (target) port
-		config.Host, err = c.getKubeAPIEndpoint(cluster)
-		if err != nil {
-			klog.Errorf("Failed to retrieve kube API enpoint for cluster %s: %v", cluster, err)
-			continue
-		}
-
-		// check that the apiserver is reachable before continue
-		// to fail fast and avoid waiting until the client operations timeout
-		var ok bool
-		for i := 0; i < 5; i++ {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			default:
-			}
-			if probeHTTP(httpClient, config.Host) {
-				ok = true
-				break
-			}
-			time.Sleep(time.Second * time.Duration(i))
-		}
-		if !ok {
-			klog.Errorf("Failed to connect to apiserver %s: %v", cluster, err)
-			continue
-		}
-
-		kubeClient, err := kubernetes.NewForConfig(config)
-		if err != nil {
-			klog.Errorf("Failed to create kubeClient for cluster %s: %v", cluster, err)
-			continue
-		}
-		return kubeClient, err
+	kconfig, err := moby.KubeConfig(ctx, cluster)
+	if err != nil {
+		klog.Errorf("Failed to get kubeconfig for cluster %s: %v", cluster, err)
+		return nil, err
 	}
-	return nil, fmt.Errorf("can not find a working kubernetes clientset")
+
+	config, err := clientcmd.RESTConfigFromKubeConfig(kconfig)
+	if err != nil {
+		klog.Errorf("Failed to convert kubeconfig for cluster %s: %v", cluster, err)
+		return nil, err
+	}
+
+	// docker provider uses NetworkConfig to retrieve control plane host:port reported by kind.KubeConfig
+	// this is the host:port exposed on docker engine host, i.e localhost:publicPort
+	// We run in a container connected to kind network, we want to access control plane using it's
+	// IP on kind network and can talk to the exposed (target) port
+	config.Host, err = c.getKubeAPIEndpoint(ctx, cluster)
+	if err != nil {
+		klog.Errorf("Failed to retrieve kube API enpoint for cluster %s: %v", cluster, err)
+		return nil, err
+	}
+
+	// check that the apiserver is reachable before continue
+	// to fail fast and avoid waiting until the client operations timeout
+	var ok bool
+	for i := 0; i < 5; i++ {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+		if probeHTTP(httpClient, config.Host) {
+			ok = true
+			break
+		}
+		time.Sleep(time.Second * time.Duration(i))
+	}
+	if !ok {
+		klog.Errorf("Failed to connect to apiserver %s: %v", cluster, err)
+		return nil, err
+	}
+
+	kubeClient, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		klog.Errorf("Failed to create kubeClient for cluster %s: %v", cluster, err)
+		return nil, err
+	}
+	return kubeClient, err
 }
 
-func (c *Controller) getKubeAPIEndpoint(cluster string) (string, error) {
-	n, err := c.kind.ListNodes(cluster)
+func (c *Controller) getKubeAPIEndpoint(ctx context.Context, cluster string) (string, error) {
+	node, err := moby.ControlPlane(ctx, cluster)
 	if err != nil {
-		klog.Errorf("Failed to list cluster nodes %s: %v", cluster, err)
 		return "", err
 	}
-	nodes, err := nodeutils.ControlPlaneNodes(n)
-	if err != nil {
-		klog.Errorf("Failed to select control-plane node %s: %v", cluster, err)
-		return "", err
-	}
-	ipv4, _, err := nodes[0].IP()
+	ipv4, _, err := moby.IPs(ctx, node)
 	if err != nil {
 		klog.Errorf("Failed to retrieve control-plane IP %s: %v", cluster, err)
 		return "", err

@@ -8,6 +8,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	cloudprovider "k8s.io/cloud-provider"
 	"k8s.io/klog/v2"
+	"sigs.k8s.io/cloud-provider-kind/pkg/moby"
 	"sigs.k8s.io/kind/pkg/cluster/nodes"
 )
 
@@ -18,7 +19,7 @@ var errNodeNotFound = errors.New("node not found")
 // InstanceExists returns true if the instance for the given node exists according to the cloud provider.
 func (c *cloud) InstanceExists(ctx context.Context, node *v1.Node) (bool, error) {
 	klog.V(2).Infof("Check if instance %s exists", node.Name)
-	_, err := c.findNodeByName(node.Name)
+	_, err := c.findNodeByName(ctx, node.Name)
 	if err == nil {
 		return true, nil
 	}
@@ -31,7 +32,7 @@ func (c *cloud) InstanceExists(ctx context.Context, node *v1.Node) (bool, error)
 // InstanceShutdown returns true of the container doesn't exist
 func (c *cloud) InstanceShutdown(ctx context.Context, node *v1.Node) (bool, error) {
 	klog.V(2).Infof("Check if instance %s is shutdown", node.Name)
-	_, err := c.findNodeByName(node.Name)
+	_, err := c.findNodeByName(ctx, node.Name)
 	if err == nil {
 		return false, nil
 	}
@@ -45,7 +46,7 @@ func (c *cloud) InstanceShutdown(ctx context.Context, node *v1.Node) (bool, erro
 // translated into specific fields and labels in the Node object on registration.
 func (c *cloud) InstanceMetadata(ctx context.Context, node *v1.Node) (*cloudprovider.InstanceMetadata, error) {
 	klog.V(2).Infof("Check instance metadata for %s", node.Name)
-	n, err := c.findNodeByName(node.Name)
+	n, err := c.findNodeByName(ctx, node.Name)
 	if err != nil {
 		return nil, err
 	}
@@ -76,8 +77,8 @@ func (c *cloud) InstanceMetadata(ctx context.Context, node *v1.Node) (*cloudprov
 	return m, nil
 }
 
-func (c *cloud) findNodeByName(name string) (nodes.Node, error) {
-	nodes, err := c.kindClient.ListNodes(c.clusterName)
+func (c *cloud) findNodeByName(ctx context.Context, name string) (nodes.Node, error) {
+	nodes, err := moby.Nodes(ctx, c.clusterName)
 	if err != nil {
 		return nil, fmt.Errorf("no nodes founds")
 	}

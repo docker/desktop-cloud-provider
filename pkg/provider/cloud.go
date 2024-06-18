@@ -5,14 +5,11 @@ import (
 	"sigs.k8s.io/cloud-provider-kind/pkg/loadbalancer"
 
 	cloudprovider "k8s.io/cloud-provider"
-
-	"sigs.k8s.io/kind/pkg/cluster"
 )
 
-func New(clusterName string, kindClient *cluster.Provider) cloudprovider.Interface {
+func New(clusterName string) cloudprovider.Interface {
 	return &cloud{
 		clusterName:  clusterName,
-		kindClient:   kindClient,
 		lbController: loadbalancer.NewServer(),
 	}
 }
@@ -22,7 +19,6 @@ var _ cloudprovider.Interface = (*cloud)(nil)
 // controller is the KIND implementation of the cloud provider interface
 type cloud struct {
 	clusterName  string // name of the kind cluster
-	kindClient   *cluster.Provider
 	lbController cloudprovider.LoadBalancer
 }
 
