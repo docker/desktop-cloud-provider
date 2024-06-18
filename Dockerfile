@@ -8,6 +8,6 @@ COPY . .
 RUN make build
 
 # build real cloud-provider-kind image
-FROM docker:25.0-dind
+FROM docker:26
 COPY --from=0 --chown=root:root ./go/src/bin/cloud-provider-kind /bin/cloud-provider-kind
 ENTRYPOINT ["/bin/cloud-provider-kind"]
