@@ -91,7 +91,8 @@ func Delete(name string) error {
 }
 
 func IsRunning(name string) bool {
-	cmd := exec.Command(containerRuntime, []string{"ps", "-q", "-f", "name=" + name}...)
+	cmd := exec.Command(containerRuntime, []string{"ps", "-q", "--filter", "label=io.kubernetes.pod.namespace=kube-system",
+		"-f", "name=" + name}...)
 	output, err := cmd.Output()
 	if err != nil || len(output) == 0 {
 		return false
@@ -203,6 +204,7 @@ func ListByLabel(label string) ([]string, error) {
 	cmd := kindexec.Command(containerRuntime,
 		"ps",
 		"-a", // show stopped nodes
+		"--filter", "label=io.kubernetes.pod.namespace=kube-system",
 		// filter for nodes with the cluster label
 		"--filter", "label="+label,
 		// format to include the cluster name

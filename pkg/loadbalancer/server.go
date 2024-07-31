@@ -179,6 +179,8 @@ func (s *Server) createLoadBalancer(clusterName string, service *v1.Service, ima
 		"--label", fmt.Sprintf("%s=%s", constants.NodeCCMLabelKey, clusterName),
 		// label the node with the load balancer name
 		"--label", fmt.Sprintf("%s=%s", constants.LoadBalancerNameLabelKey, loadBalancerSimpleName(clusterName, service)),
+		// label container as Docker Desktop kub-system namespace
+		"--label", "io.kubernetes.pod.namespace=kube-system",
 		// user a user defined docker network so we get embedded DNS
 		"--net", networkName,
 		"--init=false",
