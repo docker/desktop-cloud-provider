@@ -22,7 +22,7 @@ import (
 
 // KINDClusterKey identifies kind clusters in kubeconfig files
 func KINDClusterKey(clusterName string) string {
-	return "kind-" + clusterName
+	return "docker-" + clusterName
 }
 
 // checkKubeadmExpectations validates that a kubeadm created KUBECONFIG meets
