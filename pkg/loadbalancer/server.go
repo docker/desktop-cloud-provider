@@ -96,7 +96,11 @@ func (s *Server) EnsureLoadBalancer(ctx context.Context, clusterName string, ser
 	}
 	if !container.Exist(name) {
 		klog.V(2).Infof("creating container for loadbalancer")
-		err := s.createLoadBalancer(clusterName, service, proxyImage)
+		image := proxyImage
+		if env, ok := os.LookupEnv("PROXY_IMAGE"); ok {
+			image = env
+		}
+		err := s.createLoadBalancer(clusterName, service, image)
 		if err != nil {
 			return nil, err
 		}
