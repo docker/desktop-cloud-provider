@@ -197,7 +197,14 @@ func (s *Server) createLoadBalancer(clusterName string, service *v1.Service, ima
 		if port.Protocol != v1.ProtocolTCP && port.Protocol != v1.ProtocolUDP {
 			continue
 		}
-		args = append(args, fmt.Sprintf("--publish=%d:%d/%s", port.Port, port.Port, port.Protocol))
+
+		for _, family := range service.Spec.IPFamilies {
+			hostIP := "0.0.0.0"
+			if family == v1.IPv6Protocol {
+				hostIP = "[::]"
+			}
+			args = append(args, fmt.Sprintf("--publish=%s:%d:%d/%s", hostIP, port.Port, port.Port, port.Protocol))
+		}
 	}
 
 	args = append(args, image)
