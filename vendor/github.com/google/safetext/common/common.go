@@ -1,35 +1,82 @@
-// Copyright 2023 Google LLC.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ *
+ * Copyright 2022 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ */
 
 // Package common implements common functionality for dealing with text/template.
 package common
 
 import (
-	"io"
+	"bytes"
 	"reflect"
+	"strings"
+	"sync"
 	"text/template"
 	"text/template/parse"
 	"unicode"
 	"unicode/utf8"
-
-	"github.com/google/safetext/lockedcallbacks"
 )
 
-const textTemplateRemediationFuncName = "ApplyInjectionDetection"
+// ContainsStringsWithSpecialCharacters determines whether an object contains interface{} strings that contain special characters.
+func ContainsStringsWithSpecialCharacters(data interface{}, special string) bool {
+	if data == nil {
+		return false
+	}
 
-// EchoString is a nop string callback
-func EchoString(in string) string {
+	switch reflect.TypeOf(data).Kind() {
+	case reflect.Ptr:
+		p := reflect.ValueOf(data)
+		return !p.IsNil() && ContainsStringsWithSpecialCharacters(p.Elem().Interface(), special)
+	case reflect.String:
+		return strings.ContainsAny(reflect.ValueOf(data).String(), special)
+	case reflect.Slice, reflect.Array:
+		for i := 0; i < reflect.ValueOf(data).Len(); i++ {
+			if ContainsStringsWithSpecialCharacters(reflect.ValueOf(data).Index(i).Interface(), special) {
+				return true
+			}
+		}
+	case reflect.Map:
+		dataIter := reflect.ValueOf(data).MapRange()
+		for dataIter.Next() {
+			if ContainsStringsWithSpecialCharacters(dataIter.Value().Interface(), special) {
+				return true
+			}
+		}
+	case reflect.Struct:
+		t := reflect.TypeOf(data)
+		v := reflect.ValueOf(data)
+		n := v.NumField()
+		for i := 0; i < n; i++ {
+			r, _ := utf8.DecodeRuneInString(t.Field(i).Name)
+			if unicode.IsUpper(r) && ContainsStringsWithSpecialCharacters(v.Field(i).Interface(), special) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// FuncMap to register new template objects with.
+var FuncMap = map[string]interface{}{
+	"textTemplateRemediationFunc": textTemplateRemediationFunc,
+	"StructuralData":              echo,
+}
+
+func echo(in interface{}) interface{} {
 	return in
 }
 
@@ -39,71 +86,52 @@ func BaselineString(string) string {
 	return "baseline"
 }
 
-// The safetext library is executing each template multiple times. The goal is to see differences
-// when user's input are used and detect modifications to the structure (e.g. YAML keys).
-// text/template have a FuncMap that can be used to add functions called during the execution of
-// templates. Yet, those functions cannot be updated once the template has been parsed. As safetext
-// is modifying a specific function (to detect injection) during executions, a wrapper was
-// introduced and a function pointer is updated for each template.
-// statesmap hold those function pointers for each template that is processed by the library
-// instance.
-var statesmap = lockedcallbacks.New()
+// stringCallback provides the callback for how strings should be manipulated before
+// being pasted into the template execution result.
+var stringCallback func(string) string
+var stringCallbackLock sync.Mutex
 
-// BuildTextTemplateFuncMap generates a per template (using its name as identifier) FuncMap.
-// A Virtual callback is created as once Template.Parse() is called this is not something we can
-// update. However, in its current design, safetext requires changing the methods as templates are
-// executed multiple times and outputs are diffed to detect injection
-func BuildTextTemplateFuncMap(safeTmplUUID string) map[string]any {
-	templateRemediationFunc := statesmap.BuildTextTemplateRemediationFunc(safeTmplUUID, DeepCopyMutateStrings)
-	templateFuncMap := map[string]any{
-		textTemplateRemediationFuncName: templateRemediationFunc,
-		"StructuralData":                func(data any) any { return data },
-
-		// Sh specific callbacks
-		"AllowFlags": statesmap.BuildAllowFlagsCallbackFunc(safeTmplUUID, DeepCopyMutateStrings),
-	}
-	return templateFuncMap
+func textTemplateRemediationFunc(data interface{}) interface{} {
+	return deepCopyMutateStrings(data, stringCallback)
 }
 
 // ExecuteWithCallback performs an execution on a callback-applied template
 // (WalkApplyFuncToNonDeclaractiveActions) with a specified callback.
-func ExecuteWithCallback(tmpl *template.Template, safeTmplUUID string, cb func(string) string, result io.Writer, data any) error {
-	return statesmap.SetAndExecuteWithCallback(tmpl, safeTmplUUID, cb, result, data)
+func ExecuteWithCallback(tmpl *template.Template, cb func(string) string, result *bytes.Buffer, data interface{}) error {
+	stringCallbackLock.Lock()
+	defer stringCallbackLock.Unlock()
+	stringCallback = cb
+
+	return tmpl.Execute(result, data)
 }
 
-// ExecuteWithShCallback is like ExecuteWithCallback, but with the additional sh-specific callbacks specified.
-func ExecuteWithShCallback(tmpl *template.Template, safeTmplUUID string, cb func(string) string, allowFlagsCb func(string) string, result io.Writer, data any) error {
-	return statesmap.SetAndExecuteWithShCallback(tmpl, safeTmplUUID, cb, allowFlagsCb, result, data)
-}
-
-func makePointer(data any) any {
+func makePointer(data interface{}) interface{} {
 	rtype := reflect.New(reflect.TypeOf(data))
 	rtype.Elem().Set(reflect.ValueOf(data))
 	return rtype.Interface()
 }
 
-func dereference(data any) any {
+func dereference(data interface{}) interface{} {
 	return reflect.ValueOf(data).Elem().Interface()
 }
 
-// DeepCopyMutateStrings performs a deep copy, but mutates any strings according to the mutation callback.
-func DeepCopyMutateStrings(data any, mutateF func(string) string) any {
-	var r any
+func deepCopyMutateStrings(data interface{}, mutateF func(string) string) interface{} {
+	var r interface{}
 
 	if data == nil {
 		return nil
 	}
 
 	switch reflect.TypeOf(data).Kind() {
-	case reflect.Pointer:
+	case reflect.Ptr:
 		p := reflect.ValueOf(data)
 		if p.IsNil() {
 			r = data
 		} else {
-			c := DeepCopyMutateStrings(dereference(data), mutateF)
+			c := deepCopyMutateStrings(dereference(data), mutateF)
 			r = makePointer(c)
 
-			// Sometimes we accidentally introduce one too many layers of indirection (seems related to protobuf generated fields like ReleaseNamespace *ReleaseNamespace `... reflect:"unexport"`)
+			// Sometimes we accidentally introduce one too minterface{} layers of indirection (seems related to protobuf generated fields like ReleaseNamespace *ReleaseNamespace `... reflect:"unexport"`)
 			if reflect.TypeOf(r) != reflect.TypeOf(data) {
 				r = c
 			}
@@ -113,14 +141,14 @@ func DeepCopyMutateStrings(data any, mutateF func(string) string) any {
 	case reflect.Slice, reflect.Array:
 		rc := reflect.MakeSlice(reflect.TypeOf(data), reflect.ValueOf(data).Len(), reflect.ValueOf(data).Len())
 		for i := 0; i < reflect.ValueOf(data).Len(); i++ {
-			rc.Index(i).Set(reflect.ValueOf(DeepCopyMutateStrings(reflect.ValueOf(data).Index(i).Interface(), mutateF)))
+			rc.Index(i).Set(reflect.ValueOf(deepCopyMutateStrings(reflect.ValueOf(data).Index(i).Interface(), mutateF)))
 		}
 		r = rc.Interface()
 	case reflect.Map:
 		rc := reflect.MakeMap(reflect.TypeOf(data))
 		dataIter := reflect.ValueOf(data).MapRange()
 		for dataIter.Next() {
-			rc.SetMapIndex(dataIter.Key(), reflect.ValueOf(DeepCopyMutateStrings(dataIter.Value().Interface(), mutateF)))
+			rc.SetMapIndex(dataIter.Key(), reflect.ValueOf(deepCopyMutateStrings(dataIter.Value().Interface(), mutateF)))
 		}
 		r = rc.Interface()
 	case reflect.Struct:
@@ -135,7 +163,7 @@ func DeepCopyMutateStrings(data any, mutateF func(string) string) any {
 			// Don't copy unexported fields
 			if unicode.IsUpper(r) {
 				reflect.Indirect(s).Field(i).Set(
-					reflect.ValueOf(DeepCopyMutateStrings(v.Field(i).Interface(), mutateF)),
+					reflect.ValueOf(deepCopyMutateStrings(v.Field(i).Interface(), mutateF)),
 				)
 			}
 		}
@@ -150,6 +178,8 @@ func DeepCopyMutateStrings(data any, mutateF func(string) string) any {
 }
 
 func applyPipeCmds(cmds []*parse.CommandNode) {
+	applyFunc := "textTemplateRemediationFunc"
+
 	for _, c := range cmds {
 		newArgs := make([]parse.Node, 0)
 		for i, a := range c.Args {
@@ -171,12 +201,7 @@ func applyPipeCmds(cmds []*parse.CommandNode) {
 					newPipe := &parse.PipeNode{NodeType: parse.NodePipe, Decl: nil}
 					newPipe.Cmds = []*parse.CommandNode{
 						&parse.CommandNode{NodeType: parse.NodeCommand, Args: []parse.Node{a}},
-						&parse.CommandNode{NodeType: parse.NodeCommand, Args: []parse.Node{
-							&parse.IdentifierNode{
-								NodeType: parse.NodeIdentifier,
-								Ident:    textTemplateRemediationFuncName,
-							},
-						}},
+						&parse.CommandNode{NodeType: parse.NodeCommand, Args: []parse.Node{&parse.IdentifierNode{NodeType: parse.NodeIdentifier, Ident: applyFunc}}},
 					}
 					newArgs = append(newArgs, newPipe)
 				}
@@ -205,7 +230,7 @@ func branchNode(node parse.Node) *parse.BranchNode {
 	return nil
 }
 
-// WalkApplyFuncToNonDeclaractiveActions walks the AST, applying a pipeline function to any "paste" nodes (non-declarative action nodes)
+// WalkApplyFuncToNonDeclaractiveActions walks the AST, applying a pipeline function to interface{} "paste" nodes (non-declarative action nodes)
 func WalkApplyFuncToNonDeclaractiveActions(template *template.Template, node parse.Node) {
 	switch node := node.(type) {
 	case *parse.ActionNode:

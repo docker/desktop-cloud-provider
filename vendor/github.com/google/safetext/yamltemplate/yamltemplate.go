@@ -1,16 +1,20 @@
-// Copyright 2023 Google LLC.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ *
+ * Copyright 2022 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ */
 
 // Package yamltemplate is a drop-in-replacement for using text/template to produce YAML, that adds automatic detection for YAML injection
 package yamltemplate
@@ -30,7 +34,6 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/pborman/uuid"
 	"gopkg.in/yaml.v3"
 
 	"github.com/google/safetext/common"
@@ -58,9 +61,9 @@ type ExecError = template.ExecError
 //
 // When template execution invokes a function with an argument list, that list
 // must be assignable to the function's parameter types. Functions meant to
-// apply to arguments of arbitrary type can use parameters of type any or
+// apply to arguments of arbitrary type can use parameters of type interface{} or
 // of type reflect.Value. Similarly, functions meant to return a result of arbitrary
-// type can return any or reflect.Value.
+// type can return interface{} or reflect.Value.
 type FuncMap = template.FuncMap
 
 // Template is the representation of a parsed template. The *parse.Tree
@@ -68,30 +71,27 @@ type FuncMap = template.FuncMap
 // as unexported by all other clients.
 type Template struct {
 	unsafeTemplate *template.Template
-	uuid           string
 }
 
 // New allocates a new, undefined template with the given name.
 func New(name string) *Template {
-	id := uuid.New()
-	funcMap := common.BuildTextTemplateFuncMap(id)
-	return &Template{unsafeTemplate: template.New(name).Funcs(funcMap), uuid: id}
+	return &Template{unsafeTemplate: template.New(name).Funcs(common.FuncMap)}
 }
 
 const yamlSpecialCharacters = "{}[]&*#?|-.<>=!%@:\"'`,\r\n"
 
-func mapOrArray(in any) bool {
+func mapOrArray(in interface{}) bool {
 	return in != nil && (reflect.TypeOf(in).Kind() == reflect.Map || reflect.TypeOf(in).Kind() == reflect.Slice || reflect.TypeOf(in).Kind() == reflect.Array)
 }
 
-func allKeysMatch(base any, a any, b any) bool {
+func allKeysMatch(base interface{}, a interface{}, b interface{}) bool {
 	if base == nil {
 		return a == nil && b == nil
 	}
 
 	switch reflect.TypeOf(base).Kind() {
-	case reflect.Pointer:
-		if reflect.TypeOf(a).Kind() != reflect.Pointer || reflect.TypeOf(b).Kind() != reflect.Pointer {
+	case reflect.Ptr:
+		if reflect.TypeOf(a).Kind() != reflect.Ptr || reflect.TypeOf(b).Kind() != reflect.Ptr {
 			return false
 		}
 
@@ -168,12 +168,12 @@ func allKeysMatch(base any, a any, b any) bool {
 	return true
 }
 
-func unmarshalYaml(data []byte) ([]any, error) {
-	r := make([]any, 0)
+func unmarshalYaml(data []byte) ([]interface{}, error) {
+	r := make([]interface{}, 0)
 
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
 	for {
-		var t any
+		var t interface{}
 		err := decoder.Decode(&t)
 
 		if err == io.EOF {
@@ -191,7 +191,7 @@ func unmarshalYaml(data []byte) ([]any, error) {
 // Mutation algorithm
 func mutateString(s string) string {
 	// Longest possible output string is 2x the original
-	out := make([]rune, utf8.RuneCountInString(s)*2)
+	out := make([]rune, len(s)*2)
 
 	i := 0
 	for _, r := range s {
@@ -218,9 +218,9 @@ func mutateString(s string) string {
 //
 // If data is a reflect.Value, the template applies to the concrete
 // value that the reflect.Value holds, as in fmt.Print.
-func (t *Template) Execute(wr io.Writer, data any) (err error) {
+func (t *Template) Execute(wr io.Writer, data interface{}) (err error) {
 	if data == nil {
-		return common.ExecuteWithCallback(t.unsafeTemplate, t.uuid, common.EchoString, wr, data)
+		return t.unsafeTemplate.Execute(wr, data)
 	}
 
 	// An attacker may be able to cause type confusion or nil dereference panic during allKeysMatch
@@ -233,8 +233,15 @@ func (t *Template) Execute(wr io.Writer, data any) (err error) {
 	// Calculate requested result first
 	var requestedResult bytes.Buffer
 
-	if err := common.ExecuteWithCallback(t.unsafeTemplate, t.uuid, common.EchoString, &requestedResult, data); err != nil {
+	if err := t.unsafeTemplate.Execute(&requestedResult, data); err != nil {
 		return err
+	}
+
+	// Fast path for if there are no YAML special characters in the input strings
+	if !common.ContainsStringsWithSpecialCharacters(data, yamlSpecialCharacters) {
+		// Note: We assume the result was valid YAML, and don't check for ErrInvalidYAMLTemplate
+		requestedResult.WriteTo(wr)
+		return nil
 	}
 
 	walked, err := t.unsafeTemplate.Clone()
@@ -247,7 +254,7 @@ func (t *Template) Execute(wr io.Writer, data any) (err error) {
 
 	// Get baseline
 	var baselineResult bytes.Buffer
-	if err = common.ExecuteWithCallback(walked, t.uuid, common.BaselineString, &baselineResult, data); err != nil {
+	if err = common.ExecuteWithCallback(walked, common.BaselineString, &baselineResult, data); err != nil {
 		return err
 	}
 
@@ -264,7 +271,7 @@ func (t *Template) Execute(wr io.Writer, data any) (err error) {
 
 	// Mutate the input
 	var mutatedResult bytes.Buffer
-	if err = common.ExecuteWithCallback(walked, t.uuid, mutateString, &mutatedResult, data); err != nil {
+	if err = common.ExecuteWithCallback(walked, mutateString, &mutatedResult, data); err != nil {
 		return err
 	}
 
@@ -295,9 +302,7 @@ func (t *Template) Name() string {
 // cannot be done safely in parallel. Once the templates are constructed, they
 // can be executed in parallel.
 func (t *Template) New(name string) *Template {
-	id := uuid.New()
-	funcMap := common.BuildTextTemplateFuncMap(id)
-	return &Template{unsafeTemplate: t.unsafeTemplate.New(name).Funcs(funcMap), uuid: id}
+	return &Template{unsafeTemplate: t.unsafeTemplate.New(name).Funcs(common.FuncMap)}
 }
 
 // Clone returns a duplicate of the template, including all associated
@@ -307,9 +312,8 @@ func (t *Template) New(name string) *Template {
 // common templates and use them with variant definitions for other templates
 // by adding the variants after the clone is made.
 func (t *Template) Clone() (*Template, error) {
-	id := uuid.New()
 	nt, err := t.unsafeTemplate.Clone()
-	return &Template{unsafeTemplate: nt, uuid: id}, err
+	return &Template{unsafeTemplate: nt}, err
 }
 
 // AddParseTree associates the argument parse tree with the template t, giving
@@ -320,8 +324,7 @@ func (t *Template) AddParseTree(name string, tree *parse.Tree) (*Template, error
 	nt, err := t.unsafeTemplate.AddParseTree(name, tree)
 
 	if nt != t.unsafeTemplate {
-		id := uuid.New()
-		return &Template{unsafeTemplate: nt, uuid: id}, err
+		return &Template{unsafeTemplate: nt}, err
 	}
 	return t, err
 }
@@ -354,12 +357,10 @@ func (t *Template) Option(opt ...string) *Template {
 // Templates returns a slice of defined templates associated with t.
 func (t *Template) Templates() []*Template {
 	s := t.unsafeTemplate.Templates()
-	var id string
 
 	var ns []*Template
 	for _, nt := range s {
-		id = uuid.New()
-		ns = append(ns, &Template{unsafeTemplate: nt, uuid: id})
+		ns = append(ns, &Template{unsafeTemplate: nt})
 	}
 
 	return ns
@@ -372,7 +373,7 @@ func (t *Template) Templates() []*Template {
 // the output writer.
 // A template may be executed safely in parallel, although if parallel
 // executions share a Writer the output may be interleaved.
-func (t *Template) ExecuteTemplate(wr io.Writer, name string, data any) error {
+func (t *Template) ExecuteTemplate(wr io.Writer, name string, data interface{}) error {
 	tmpl := t.Lookup(name)
 	if tmpl == nil {
 		return fmt.Errorf("template: no template %q associated with template %q", name, t.Name())
@@ -419,8 +420,7 @@ func (t *Template) Lookup(name string) *Template {
 	}
 
 	if nt != t.unsafeTemplate {
-		id := uuid.New()
-		return &Template{unsafeTemplate: nt, uuid: id}
+		return &Template{unsafeTemplate: nt}
 	}
 
 	return t
@@ -440,8 +440,7 @@ func (t *Template) Parse(text string) (*Template, error) {
 	nt, err := t.unsafeTemplate.Parse(text)
 
 	if nt != t.unsafeTemplate {
-		id := uuid.New()
-		return &Template{unsafeTemplate: nt, uuid: id}, err
+		return &Template{unsafeTemplate: nt}, err
 	}
 
 	return t, err
@@ -624,14 +623,14 @@ func HTMLEscapeString(s string) string {
 
 // HTMLEscaper returns the escaped HTML equivalent of the textual
 // representation of its arguments.
-func HTMLEscaper(args ...any) string {
+func HTMLEscaper(args ...interface{}) string {
 	return template.HTMLEscaper(args)
 }
 
 // IsTrue reports whether the value is 'true', in the sense of not the zero of its type,
 // and whether the value has a meaningful truth value. This is the definition of
 // truth used by if and other such actions.
-func IsTrue(val any) (truth, ok bool) {
+func IsTrue(val interface{}) (truth, ok bool) {
 	return template.IsTrue(val)
 }
 
@@ -647,12 +646,12 @@ func JSEscapeString(s string) string {
 
 // JSEscaper returns the escaped JavaScript equivalent of the textual
 // representation of its arguments.
-func JSEscaper(args ...any) string {
+func JSEscaper(args ...interface{}) string {
 	return template.JSEscaper(args)
 }
 
 // URLQueryEscaper returns the escaped value of the textual representation of
 // its arguments in a form suitable for embedding in a URL query.
-func URLQueryEscaper(args ...any) string {
+func URLQueryEscaper(args ...interface{}) string {
 	return template.URLQueryEscaper(args)
 }
