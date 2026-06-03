@@ -1,4 +1,4 @@
-FROM golang:1.25
+FROM golang:1.26
 WORKDIR /go/src
 # make deps fetching cacheable
 COPY go.mod go.sum ./
@@ -8,6 +8,6 @@ COPY . .
 RUN make build
 
 # build real cloud-provider-kind image
-FROM docker:29.1
+FROM docker:29.5
 COPY --from=0 --chown=root:root ./go/src/bin/cloud-provider-kind /bin/cloud-provider-kind
 ENTRYPOINT ["/bin/cloud-provider-kind"]
