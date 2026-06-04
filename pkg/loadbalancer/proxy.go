@@ -150,19 +150,23 @@ resources:
 {{- range $index, $servicePort := .ServicePorts }}
 - "@type": type.googleapis.com/envoy.config.cluster.v3.Cluster
   name: cluster_{{$index}}
-  connect_timeout: 5s
+  connect_timeout: 3s
   type: STATIC
+  common_lb_config:
+    healthy_panic_threshold:
+      value: 0
   {{- if eq $.SessionAffinity "ClientIP"}}
   lb_policy: RING_HASH
   {{- else}}
   lb_policy: RANDOM
   {{- end}}
   health_checks:
-  - timeout: 5s
-    interval: 3s
+  - timeout: 3s
+    interval: 2s
     unhealthy_threshold: 2
     healthy_threshold: 1
-    no_traffic_interval: 5s
+    initial_jitter: 0s
+    no_traffic_interval: 3s
     always_log_health_check_failures: true
     always_log_health_check_success: true
     event_log_path: /dev/stdout
@@ -321,7 +325,7 @@ func waitLoadBalancerReady(ctx context.Context, name string, timeout time.Durati
 		// we run in a container connected to kind network, so can directly access LB by it's container name and exposed port
 		resp, err := httpClient.Get(fmt.Sprintf("http://%s:%d/ready", name, envoyAdminPort))
 		if err != nil {
-			klog.V(2).Infof("unexpected error trying to get load balancer %s readyness :%v", name, err)
+			klog.V(2).Infof("unexpected error trying to get load balancer %s readiness :%v", name, err)
 			return false, nil
 		}
 		defer resp.Body.Close()
@@ -333,7 +337,7 @@ func waitLoadBalancerReady(ctx context.Context, name string, timeout time.Durati
 
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
-			klog.V(2).Infof("unexpected error trying to get load balancer %s readyness :%v", name, err)
+			klog.V(2).Infof("unexpected error trying to get load balancer %s readiness :%v", name, err)
 			return false, nil
 		}
 

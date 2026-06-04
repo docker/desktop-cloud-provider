@@ -32,15 +32,49 @@ func podmanIsAvailable() bool {
 		return false
 	}
 	return strings.HasPrefix(lines[0], "podman version")
+}
 
+func nerdctlIsAvailable() bool {
+	cmd := kindexec.Command("nerdctl", "-v")
+	lines, err := kindexec.OutputLines(cmd)
+	if err != nil || len(lines) != 1 {
+		// check finch
+		cmd = kindexec.Command("finch", "-v")
+		lines, err = kindexec.OutputLines(cmd)
+		if err != nil || len(lines) != 1 {
+			return false
+		}
+		return strings.HasPrefix(lines[0], "finch version")
+	}
+	return strings.HasPrefix(lines[0], "nerdctl version")
+}
+
+// Runtime returns the detected container runtime name.
+func Runtime() string {
+	return containerRuntime
 }
 
 func init() {
+	// allow to override the container provider as we do in KIND
+	if p := os.Getenv("KIND_EXPERIMENTAL_PROVIDER"); p != "" {
+		containerRuntime = p
+		return
+	}
+
 	if dockerIsAvailable() {
 		return
 	}
 	if podmanIsAvailable() {
 		containerRuntime = "podman"
+		return
+	}
+	if nerdctlIsAvailable() {
+		containerRuntime = "nerdctl"
+		if _, err := exec.LookPath("nerdctl"); err != nil {
+			if _, err := exec.LookPath("finch"); err == nil {
+				containerRuntime = "finch"
+			}
+		}
 	}
 }
 
@@ -192,7 +226,7 @@ func PortMaps(name string) (map[string]string, error) {
 		// TODO we just can get the first entry or look for ip families
 		for _, pm := range v {
 			if pm.HostPort != "" {
-				result[parts[0]] = pm.HostPort
+				result[parts[0]+"/"+protocol] = pm.HostPort
 				break
 			}
 		}

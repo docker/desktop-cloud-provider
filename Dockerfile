@@ -5,7 +5,8 @@ COPY go.mod go.sum ./
 RUN go mod download
 # build
 COPY . .
-RUN make build
+ARG TARGETARCH
+RUN GOARCH=$TARGETARCH make build
 
 # build real cloud-provider-kind image
 FROM docker:29.1

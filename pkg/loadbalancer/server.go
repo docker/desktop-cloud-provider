@@ -3,9 +3,9 @@ package loadbalancer
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/base32"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"strings"
@@ -146,11 +146,13 @@ func (s *Server) EnsureLoadBalancerDeleted(ctx context.Context, clusterName stri
 
 // loadbalancer name is a unique name for the loadbalancer container
 func loadBalancerName(clusterName string, service *v1.Service) string {
-	hash := sha256.Sum256([]byte(loadBalancerSimpleName(clusterName, service)))
-	encoded := base32.StdEncoding.EncodeToString(hash[:])
-	name := constants.ContainerPrefix + "-" + encoded[:40]
-
-	return name
+	h := sha256.New()
+	_, err := io.WriteString(h, loadBalancerSimpleName(clusterName, service))
+	if err != nil {
+		panic(err)
+	}
+	hash := h.Sum(nil)
+	return fmt.Sprintf("%s-%x", constants.ContainerPrefix, hash[:6])
 }
 
 func loadBalancerSimpleName(clusterName string, service *v1.Service) string {
@@ -207,6 +209,10 @@ func (s *Server) createLoadBalancer(clusterName string, service *v1.Service, ima
 		}
 	}
 
+	if service.Spec.LoadBalancerIP != "" {
+		args = append(args, "--ip", service.Spec.LoadBalancerIP)
+	}
+
 	args = append(args, image)
 	// we need to override the default envoy configuration
 	// https://www.envoyproxy.io/docs/envoy/latest/start/quick-start/configuration-dynamic-filesystem
@@ -225,4 +231,16 @@ func (s *Server) createLoadBalancer(clusterName string, service *v1.Service, ima
 	}
 
 	return nil
+}
+
+func isIPv6Service(service *v1.Service) bool {
+	if service == nil {
+		return false
+	}
+	for _, family := range service.Spec.IPFamilies {
+		if family == v1.IPv6Protocol {
+			return true
+		}
+	}
+	return false
 }
