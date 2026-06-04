@@ -14,6 +14,9 @@ export GOROOT GO111MODULE CGO_ENABLED
 build:
 	go build -v -o "$(OUT_DIR)/$(KIND_CLOUD_BINARY_NAME)" $(KIND_CLOUD_BUILD_FLAGS) main.go
 
+image:
+	docker build -t docker/desktop-cloud-provider-kind .
+
 clean:
 	rm -rf "$(OUT_DIR)/"
 
