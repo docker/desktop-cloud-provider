@@ -8,8 +8,9 @@ COPY . .
 RUN make build
 
 # build real cloud-provider-kind image
-FROM docker:29.10.0
-# pick up ca-certificates >= 20261020-r0 (distrusts compromised eMudhra intermediates)
-RUN apk upgrade --no-cache ca-certificates ca-certificates-bundle
+# only the docker CLI is needed, the engine is reached through the mounted docker socket
+FROM docker:29.10.0-cli
+# pick up Alpine security fixes (incl. ca-certificates >= 20261020-r0, eMudhra distrust)
+RUN apk upgrade --no-cache
 COPY --from=0 --chown=root:root ./go/src/bin/cloud-provider-kind /bin/cloud-provider-kind
 ENTRYPOINT ["/bin/cloud-provider-kind"]
