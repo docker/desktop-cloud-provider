@@ -11,9 +11,15 @@
 #
 # Cases that need a human:
 #  - merge conflict: nothing is pushed and the run fails. Merge the tag by hand
-#    into a branch named `upstream-sync/<tag>` and open a PR from it: the next
-#    run picks it up, runs ci on it and merges it.
+#    into a branch named `upstream-sync/<tag>`, pushed to THIS repository (not a
+#    fork), and open a PR from it (as a draft until it is ready): the next run
+#    picks it up, runs ci on it and merges it. A PR from a fork on that branch
+#    name is left alone by the workflow. Conflicts are expected to be the norm
+#    rather than the exception (go.mod, go.sum and the Dockerfile are modified on
+#    both sides).
 #  - ci failure: the PR stays open. Fix the branch; the next run retries.
+#  - PR merged by hand with squash/rebase: the tag is not an ancestor of the
+#    default branch, the run fails. Merge the tag again with a merge commit.
 #  - to skip a tag, close its PR (or convert it to draft to put it on hold).
 #
 # Upstream tags are deliberately NOT fetched into refs/tags: this fork pushes
@@ -45,7 +51,6 @@ jobs:
       pr: ${{ steps.select.outputs.pr || steps.pr.outputs.pr }}
       head: ${{ steps.select.outputs.head || steps.pr.outputs.head }}
     env:
-      GH_TOKEN: ${{ github.token }}
       DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
     steps:
       -
@@ -54,9 +59,20 @@ jobs:
         with:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
+          # The write token must not sit in .git/config while `make update`
+          # runs the merged Makefile. It is only handed to the steps that talk
+          # to GitHub, through the gh credential helper (GH_TOKEN in the env).
+          persist-credentials: false
+      -
+        name: Configure git credentials
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh auth setup-git
       -
         name: Select the latest stable upstream tag
         id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -81,17 +97,26 @@ jobs:
           fi
 
           # An earlier run (or a human) may already have handled this tag.
-          # Only a same-repo PR targeting the default branch counts: a fork PR
-          # may carry the same branch name.
-          pr=$(gh pr list --head "$branch" --base "$DEFAULT_BRANCH" --state all \
-            --json number,state,isDraft,isCrossRepository,headRefOid \
-            --jq 'map(select(.isCrossRepository | not)) | .[0] // empty')
+          # Only a same-repo PR targeting the default branch can be resumed (its
+          # head lives in this repository, where ci and the merge can reach it).
+          prs=$(gh pr list --head "$branch" --base "$DEFAULT_BRANCH" --state all \
+            --json number,state,isDraft,isCrossRepository,headRefOid)
+          pr=$(jq -c 'map(select(.isCrossRepository | not)) | .[0] // empty' <<<"$prs")
+          if [ -z "$pr" ] && [ -n "$(jq -r '.[] | select(.isCrossRepository and .state == "OPEN") | .number' <<<"$prs")" ]; then
+            echo "::notice::an open PR from a fork already carries the branch name $branch: left to the human on it (push the branch to this repository to have it merged by the workflow)"
+            echo "action=none" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [ -n "$pr" ]; then
             state=$(jq -r .state <<<"$pr")
             draft=$(jq -r .isDraft <<<"$pr")
             head=$(jq -r .headRefOid <<<"$pr")
+            if [ "$state" = MERGED ]; then
+              echo "::error::PR for $tag is merged but $tag is not in $DEFAULT_BRANCH: merged with squash/rebase? Merge the tag again with a merge commit"
+              exit 1
+            fi
             if [ "$state" != OPEN ]; then
-              echo "::warning::PR for $tag is $state but $tag is not in $DEFAULT_BRANCH: left alone (merged with squash/rebase, or skipped on purpose?)"
+              echo "::warning::PR for $tag is $state: skipped on purpose, left alone"
               echo "action=none" >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -104,6 +129,13 @@ jobs:
             git fetch --no-tags origin "$branch"
             if ! git merge-base --is-ancestor "$sha" "$head"; then
               echo "::error::open PR for $tag does not contain $sha: not merging it"
+              exit 1
+            fi
+            # The PR is merged on the ci result of its own head: that result
+            # only holds for the merge if the branch is up to date with
+            # $DEFAULT_BRANCH, otherwise a clean but broken merge is possible.
+            if ! git merge-base --is-ancestor HEAD "$head"; then
+              echo "::error::open PR for $tag is behind $DEFAULT_BRANCH: merge $DEFAULT_BRANCH into $branch (the next run will validate it)"
               exit 1
             fi
             echo "Open PR for $tag found: resuming it" | tee -a "$GITHUB_STEP_SUMMARY"
@@ -121,6 +153,7 @@ jobs:
         name: Merge the tag
         if: steps.select.outputs.action == 'merge'
         env:
+          GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.select.outputs.tag }}
           SHA: ${{ steps.select.outputs.sha }}
           BRANCH: ${{ steps.select.outputs.branch }}
@@ -148,8 +181,13 @@ jobs:
           fi
 
           # Paths the fork owns, whatever upstream did there:
-          #  - .github: the fork's own CI configuration (this also keeps the push
-          #    within what GITHUB_TOKEN may do, it cannot touch workflow files);
+          #  - .github: the fork's own CI configuration. This also keeps the push
+          #    within what GITHUB_TOKEN may do: it cannot create or update
+          #    workflow files. GitHub checks the resulting tree, not each pushed
+          #    commit, so upstream commits touching .github are fine as long as
+          #    the merge leaves it identical to the default branch (verified:
+          #    add+restore commits, alone or brought in by a merge, are accepted;
+          #    a commit that keeps a workflow change is refused);
           #  - vendor: generated, upstream does not vendor. It is rebuilt from
           #    go.mod by the "Refresh vendor" step.
           for dir in .github vendor; do
@@ -163,7 +201,7 @@ jobs:
             {
               echo "### Merge of upstream $TAG conflicts with the default branch"
               echo
-              echo "Resolve it by hand on a branch named \`$BRANCH\` and open a PR from it; the next run will validate and merge it."
+              echo "Resolve it by hand on a branch named \`$BRANCH\` pushed to this repository (not a fork), and open a PR from it; the next run will validate and merge it."
               echo
               echo "Conflicting files:"
               echo '```'
@@ -203,6 +241,7 @@ jobs:
         id: pr
         if: steps.select.outputs.action == 'merge'
         env:
+          GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.select.outputs.tag }}
           SHA: ${{ steps.select.outputs.sha }}
           BRANCH: ${{ steps.select.outputs.branch }}
@@ -225,8 +264,6 @@ jobs:
           - the fork's own \`.github\` directory is kept untouched, and \`vendor/\` is regenerated from \`go.mod\`.
 
           The PR is merged by the workflow, with a merge commit so the tag stays in the branch ancestry, as soon as the \`ci\` job of that run is green. If it fails, the PR stays open for manual follow-up; close it to skip this tag, or convert it to draft to put it on hold.
-
-          🤖 Generated with [Claude Code](https://claude.com/claude-code)
           EOF2
 
           gh pr create --base "$DEFAULT_BRANCH" --head "$BRANCH" \

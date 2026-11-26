@@ -33,8 +33,9 @@ jobs:
         with:
           go-version-file: go.mod
       -
+        # Same build as the release image (CGO disabled, see the Makefile).
         name: Build
-        run: go build ./...
+        run: make build
       -
         name: Vet
         run: go vet ./...
@@ -55,4 +56,12 @@ jobs:
           persist-credentials: false
       -
         name: Build image
-        run: docker build .
+        run: docker build -t ci-image .
+      -
+        # The fork's own entrypoint must survive a clean merge of upstream.
+        name: Check the entrypoint
+        run: |
+          set -euo pipefail
+          entrypoint=$(docker inspect --format '{{json .Config.Entrypoint}}' ci-image)
+          echo "entrypoint: $entrypoint"
+          test "$entrypoint" = '["/bin/cloud-provider-kind"]'
