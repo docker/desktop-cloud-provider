@@ -1,0 +1,297 @@
+package gateway
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"fmt"
+	"io"
+	"net"
+	"net/netip"
+	"os"
+	"strings"
+	"text/template"
+
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/klog/v2"
+	"sigs.k8s.io/cloud-provider-kind/pkg/config"
+	"sigs.k8s.io/cloud-provider-kind/pkg/constants"
+	"sigs.k8s.io/cloud-provider-kind/pkg/container"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+)
+
+// keep in sync with dynamicControlPlaneConfig
+const (
+	proxyConfigPath = "/home/envoy/envoy.yaml"
+	envoyAdminPort  = 10000
+
+	// well known dns to reach host from containers
+	// https://github.com/containerd/nerdctl/issues/747
+	dockerInternal = "host.docker.internal"
+	limaInternal   = "host.lima.internal"
+)
+
+// https://www.envoyproxy.io/docs/envoy/latest/start/quick-start/configuration-dynamic-control-plane
+const dynamicControlPlaneConfig = `node:
+  cluster: {{ .Cluster }}
+  id: {{ .ID }}
+
+dynamic_resources:
+  ads_config:
+    api_type: GRPC
+    grpc_services:
+    - envoy_grpc:
+        cluster_name: xds_cluster
+  cds_config:
+    ads: {}
+  lds_config:
+    ads: {}
+
+static_resources:
+  clusters:
+  - type: STRICT_DNS
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        explicit_http_config:
+          http2_protocol_options: {}
+    name: xds_cluster
+    load_assignment:
+      cluster_name: xds_cluster
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: {{ .ControlPlaneAddress }}
+                port_value: {{ .ControlPlanePort }}
+        - endpoint:
+            address:
+              socket_address:
+                address: host.docker.internal
+                port_value: {{ .ControlPlanePort }}
+        - endpoint:
+            address:
+              socket_address:
+                address: host.lima.internal
+                port_value: {{ .ControlPlanePort }}
+
+admin:
+  access_log_path: /dev/stdout
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: {{ .AdminPort }}
+`
+
+type configData struct {
+	Cluster             string
+	ID                  string
+	AdminPort           int
+	ControlPlaneAddress string
+	ControlPlanePort    int
+}
+
+// generateEnvoyConfig returns an envoy config generated from config data
+func generateEnvoyConfig(data *configData) (string, error) {
+	if data.Cluster == "" ||
+		data.ID == "" ||
+		data.AdminPort == 0 ||
+		data.ControlPlaneAddress == "" ||
+		data.ControlPlanePort == 0 {
+		return "", fmt.Errorf("missing parameters")
+	}
+
+	t, err := template.New("gateway-config").Parse(dynamicControlPlaneConfig)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse config template: %w", err)
+	}
+	// execute the template
+	var buff bytes.Buffer
+	err = t.Execute(&buff, data)
+	if err != nil {
+		return "", fmt.Errorf("error executing config template: %w", err)
+	}
+	return buff.String(), nil
+}
+
+// gatewayName name is a unique name for the gateway container
+func gatewayName(clusterName, namespace, name string) string {
+	h := sha256.New()
+	_, err := io.WriteString(h, gatewaySimpleName(clusterName, namespace, name))
+	if err != nil {
+		panic(err)
+	}
+	hash := h.Sum(nil)
+	return fmt.Sprintf("%s-gw-%x", constants.ContainerPrefix, hash[:6])
+}
+
+func gatewaySimpleName(clusterName, namespace, name string) string {
+	return clusterName + "/" + namespace + "/" + name
+}
+
+// missingPublishedPorts returns the Listener ports, in port/protocol format, that
+// are not published by the container according to its portmaps.
+func missingPublishedPorts(gateway *gatewayv1.Gateway, portmaps map[string]string) []string {
+	missing := sets.New[string]()
+	for _, listener := range gateway.Spec.Listeners {
+		key := fmt.Sprintf("%d/%s", listener.Port, listenerProtocol(listener))
+		if _, ok := portmaps[key]; !ok {
+			missing.Insert(key)
+		}
+	}
+	if missing.Len() == 0 {
+		return nil
+	}
+	return sets.List(missing)
+}
+
+// listenerProtocol returns the transport protocol of the Listener as published by the container.
+func listenerProtocol(listener gatewayv1.Listener) string {
+	if listener.Protocol == gatewayv1.UDPProtocolType {
+		return "udp"
+	}
+	return "tcp"
+}
+
+// createGateway create a docker container with a gateway.
+// keepIPv4 and keepIPv6, if not empty, are assigned to the container for the IP
+// families the Gateway does not request an address for.
+func createGateway(clusterName string, nameserver string, localAddress string, localPort int, gateway *gatewayv1.Gateway, enableTunnel bool, keepIPv4, keepIPv6 string) error {
+	name := gatewayName(clusterName, gateway.Namespace, gateway.Name)
+	simpleName := gatewaySimpleName(clusterName, gateway.Namespace, gateway.Name)
+	envoyConfigData := &configData{
+		ID:                  name,
+		Cluster:             simpleName,
+		AdminPort:           envoyAdminPort,
+		ControlPlaneAddress: localAddress,
+		ControlPlanePort:    localPort,
+	}
+	dynamicFilesystemConfig, err := generateEnvoyConfig(envoyConfigData)
+	if err != nil {
+		return err
+	}
+	networkName := constants.FixedNetworkName
+	if n := os.Getenv("KIND_EXPERIMENTAL_DOCKER_NETWORK"); n != "" {
+		networkName = n
+	}
+
+	args := []string{
+		"--detach",
+		"--tty",
+		"--user=0",
+		"--label", fmt.Sprintf("%s=%s", constants.NodeCCMLabelKey, clusterName),
+		"--label", fmt.Sprintf("%s=%s", constants.GatewayNameLabelKey, simpleName),
+		"--net", networkName,
+		"--dns", nameserver,
+		"--init=false",
+		"--stop-signal=SIGKILL",
+		"--hostname", name,
+		"--privileged",
+		"--restart=on-failure",
+		"--sysctl=net.ipv4.ip_forward=1",
+		"--sysctl=net.ipv4.conf.all.rp_filter=0",
+		"--sysctl=net.ipv4.ip_unprivileged_port_start=1",
+	}
+
+	// support to specify addresses
+	// only the first of each IP family will be used
+	// listenAddress tracks the host bind address for port publishing: "0.0.0.0" for IPv4-only,
+	// "::" for IPv6-only, or "" for dual-stack/unspecified (publish on all interfaces).
+	var ipv4, ipv6, listenAddress string
+	for _, address := range gateway.Spec.Addresses {
+		if address.Type != nil && *address.Type != gatewayv1.IPAddressType {
+			continue
+		}
+		ip, err := netip.ParseAddr(address.Value)
+		if err != nil {
+			continue
+		}
+		if ip.Is4() {
+			if ipv4 == "" {
+				ipv4 = address.Value
+				args = append(args, "--ip", ip.String())
+				if ipv6 == "" {
+					listenAddress = "0.0.0.0"
+				} else {
+					listenAddress = "" // dual-stack
+				}
+			}
+		} else if ip.Is6() {
+			if ipv6 == "" {
+				ipv6 = address.Value
+				args = append(args, "--ip6", ip.String())
+				if ipv4 == "" {
+					listenAddress = "::"
+				} else {
+					listenAddress = "" // dual-stack
+				}
+			}
+		}
+	}
+	if len(gateway.Spec.Addresses) > 0 && ipv4 != "" && ipv6 == "" {
+		// Only the explicitly requested addresses should be assigned. Since none of them is IPv6, disable IPv6.
+		args = append(args, []string{
+			"--sysctl=net.ipv6.conf.all.disable_ipv6=1",
+		}...)
+	} else {
+		args = append(args, []string{
+			"--sysctl=net.ipv6.conf.all.disable_ipv6=0",
+			"--sysctl=net.ipv6.conf.all.forwarding=1",
+		}...)
+		if ipv6 == "" && keepIPv6 != "" {
+			args = append(args, "--ip6", keepIPv6)
+		}
+	}
+	if ipv4 == "" && keepIPv4 != "" {
+		args = append(args, "--ip", keepIPv4)
+	}
+
+	if enableTunnel ||
+		config.DefaultConfig.LoadBalancerConnectivity == config.Portmap {
+		// Forward the Listener Ports to the host so they are accessible on Mac and Windows.
+		// For single IP-family gateways, explicitly bind on the matching listen address to avoid
+		// dual-stack host bindings that cause connection resets in environments where IPv6 is
+		// advertised but not functional end-to-end (e.g. some GitHub Actions runners).
+		// For dual-stack or unspecified gateways, publish without an explicit address.
+		// See https://github.com/kubernetes-sigs/cloud-provider-kind/issues/387
+		// The host port is left empty so it is ephemeral; pinning it to the listener port
+		// makes two Gateways with the same listener port collide on the host.
+		// See https://github.com/kubernetes-sigs/cloud-provider-kind/issues/458
+		seen := make(map[string]struct{})
+		for _, listener := range gateway.Spec.Listeners {
+			proto := listenerProtocol(listener)
+
+			var publishArg string
+			if listenAddress != "" {
+				publishArg = fmt.Sprintf("--publish=%s:%d/%s", net.JoinHostPort(listenAddress, ""), listener.Port, proto)
+			} else {
+				publishArg = fmt.Sprintf("--publish=%d/%s", listener.Port, proto)
+			}
+
+			if _, exists := seen[publishArg]; exists {
+				continue
+			}
+
+			seen[publishArg] = struct{}{}
+			args = append(args, publishArg)
+		}
+	}
+	args = append(args, "--publish-all")
+
+	// Construct the multi-step command
+	var startupCmd strings.Builder
+	startupCmd.WriteString(fmt.Sprintf("echo -en '%s' > %s && ", dynamicFilesystemConfig, proxyConfigPath))    // nolint:staticcheck
+	startupCmd.WriteString(fmt.Sprintf("while true; do envoy -c %s && break; sleep 1; done", proxyConfigPath)) // nolint:staticcheck
+
+	args = append(args, config.DefaultConfig.ProxyImage)
+	cmd := []string{"bash", "-c", startupCmd.String()}
+	args = append(args, cmd...)
+
+	klog.V(2).Infof("creating gateway with parameters: %v", args)
+	err = container.Create(name, args)
+	if err != nil {
+		return fmt.Errorf("failed to create containers %s %v: %w", name, args, err)
+	}
+
+	return nil
+}

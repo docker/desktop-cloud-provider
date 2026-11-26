@@ -1,3 +1,4 @@
+version: 2
 project_name: cloud-provider-kind
 builds:
   - env: [CGO_ENABLED=0]
@@ -8,3 +9,5 @@ builds:
     goarch:
       - amd64
       - arm64
+    ldflags:
+      - -s -w -X sigs.k8s.io/cloud-provider-kind/cmd.version={{.Version}}

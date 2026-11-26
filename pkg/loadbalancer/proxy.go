@@ -5,7 +5,11 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"text/template"
 	"time"
@@ -16,11 +20,9 @@ import (
 	"k8s.io/klog/v2"
 	netutils "k8s.io/utils/net"
 
+	"sigs.k8s.io/cloud-provider-kind/pkg/config"
 	"sigs.k8s.io/cloud-provider-kind/pkg/container"
 )
-
-// proxyImage defines the loadbalancer image:tag
-const proxyImage = "envoyproxy/envoy:v1.30.1"
 
 // keep in sync with dynamicFilesystemConfig
 const (
@@ -28,6 +30,13 @@ const (
 	proxyConfigPathCDS = "/home/envoy/cds.yaml"
 	proxyConfigPathLDS = "/home/envoy/lds.yaml"
 	envoyAdminPort     = 10000
+)
+
+// File names looked up in config.DefaultConfig.LoadBalancerConfigDir to
+// override the built-in templates.
+const (
+	LDSTemplateFile = "lds.yaml.tmpl"
+	CDSTemplateFile = "cds.yaml.tmpl"
 )
 
 // start Envoy with dynamic configuration by using files that implement the xDS protocol.
@@ -48,16 +57,23 @@ admin:
   access_log_path: /dev/stdout
   address:
     socket_address:
-      address: 0.0.0.0
+      address: "::"
       port_value: 10000
+      ipv4_compat: true
 `
 
-// proxyConfigData is supplied to the loadbalancer config template
+// proxyConfigData is supplied to the loadbalancer config template.
+// User provided templates (see LoadBalancerConfigDir) receive the same data,
+// so changes to this struct are user visible.
 type proxyConfigData struct {
 	HealthCheckPort int                    // is the same for all ServicePorts
 	ServicePorts    map[string]servicePort // key is the IP family and Port and Protocol to support MultiPort services
 	SessionAffinity string
 	SourceRanges    []sourceRange
+	// Service and Nodes are the objects the configuration is generated from,
+	// so user templates can branch on their own labels or annotations.
+	Service *v1.Service
+	Nodes   []*v1.Node
 }
 
 type sourceRange struct {
@@ -150,19 +166,23 @@ resources:
 {{- range $index, $servicePort := .ServicePorts }}
 - "@type": type.googleapis.com/envoy.config.cluster.v3.Cluster
   name: cluster_{{$index}}
-  connect_timeout: 5s
+  connect_timeout: 3s
   type: STATIC
+  common_lb_config:
+    healthy_panic_threshold:
+      value: 0
   {{- if eq $.SessionAffinity "ClientIP"}}
   lb_policy: RING_HASH
   {{- else}}
   lb_policy: RANDOM
   {{- end}}
   health_checks:
-  - timeout: 5s
-    interval: 3s
+  - timeout: 3s
+    interval: 2s
     unhealthy_threshold: 2
     healthy_threshold: 1
-    no_traffic_interval: 5s
+    initial_jitter: 0s
+    no_traffic_interval: 3s
     always_log_health_check_failures: true
     always_log_health_check_success: true
     event_log_path: /dev/stdout
@@ -185,8 +205,7 @@ resources:
 {{- end }}
 `
 
-// proxyConfig returns a kubeadm config generated from config data, in particular
-// the kubernetes version
+// proxyConfig returns the Envoy config generated from the template and the config data
 func proxyConfig(configTemplate string, data *proxyConfigData) (config string, err error) {
 	t, err := template.New("loadbalancer-config").Parse(configTemplate)
 	if err != nil {
@@ -201,6 +220,41 @@ func proxyConfig(configTemplate string, data *proxyConfigData) (config string, e
 	return buff.String(), nil
 }
 
+// loadTemplate returns the content of dir/name if it exists, otherwise the
+// built-in template. An empty dir disables the lookup.
+func loadTemplate(dir, name, builtin string) (string, error) {
+	if dir == "" {
+		return builtin, nil
+	}
+	path := filepath.Join(dir, name)
+	content, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return builtin, nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to read template %s: %w", path, err)
+	}
+	klog.V(2).Infof("using template override %s", path)
+	return string(content), nil
+}
+
+// DumpDefaultTemplates writes the built-in LDS and CDS templates to dir so
+// users can edit them and pass the directory to LoadBalancerConfigDir.
+func DumpDefaultTemplates(dir string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	for name, content := range map[string]string{
+		LDSTemplateFile: proxyLDSConfigTemplate,
+		CDSTemplateFile: proxyCDSConfigTemplate,
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func generateConfig(service *v1.Service, nodes []*v1.Node) *proxyConfigData {
 	if service == nil {
 		return nil
@@ -213,6 +267,8 @@ func generateConfig(service *v1.Service, nodes []*v1.Node) *proxyConfigData {
 	lbConfig := &proxyConfigData{
 		HealthCheckPort: hcPort,
 		SessionAffinity: string(service.Spec.SessionAffinity),
+		Service:         service,
+		Nodes:           nodes,
 	}
 
 	servicePortConfig := map[string]servicePort{}
@@ -279,9 +335,14 @@ func proxyUpdateLoadBalancer(ctx context.Context, clusterName string, service *v
 	}
 	var stdout, stderr bytes.Buffer
 	name := loadBalancerName(clusterName, service)
+	templateDir := config.DefaultConfig.LoadBalancerConfigDir
 	config := generateConfig(service, nodes)
 	// create loadbalancer config data
-	ldsConfig, err := proxyConfig(proxyLDSConfigTemplate, config)
+	ldsTemplate, err := loadTemplate(templateDir, LDSTemplateFile, proxyLDSConfigTemplate)
+	if err != nil {
+		return err
+	}
+	ldsConfig, err := proxyConfig(ldsTemplate, config)
 	if err != nil {
 		return errors.Wrap(err, "failed to generate loadbalancer config data")
 	}
@@ -292,7 +353,11 @@ func proxyUpdateLoadBalancer(ctx context.Context, clusterName string, service *v
 		return err
 	}
 
-	cdsConfig, err := proxyConfig(proxyCDSConfigTemplate, config)
+	cdsTemplate, err := loadTemplate(templateDir, CDSTemplateFile, proxyCDSConfigTemplate)
+	if err != nil {
+		return err
+	}
+	cdsConfig, err := proxyConfig(cdsTemplate, config)
 	if err != nil {
 		return errors.Wrap(err, "failed to generate loadbalancer config data")
 	}
@@ -314,14 +379,32 @@ func proxyUpdateLoadBalancer(ctx context.Context, clusterName string, service *v
 }
 
 func waitLoadBalancerReady(ctx context.Context, name string, timeout time.Duration) error {
-	httpClient := http.DefaultClient
-	err := wait.PollUntilContextTimeout(ctx, 1*time.Second, timeout, true, func(ctx context.Context) (done bool, err error) {
-		// iptables port forwarding on localhost only works for IPv4
+	portmaps, err := container.PortMaps(name)
+	if err != nil {
+		return err
+	}
 
-		// we run in a container connected to kind network, so can directly access LB by it's container name and exposed port
-		resp, err := httpClient.Get(fmt.Sprintf("http://%s:%d/ready", name, envoyAdminPort))
+	var authority string
+	if config.DefaultConfig.ControlPlaneConnectivity == config.Direct {
+		ipv4, _, err := container.IPs(name)
 		if err != nil {
-			klog.V(2).Infof("unexpected error trying to get load balancer %s readyness :%v", name, err)
+			return err
+		}
+		authority = net.JoinHostPort(ipv4, strconv.Itoa(envoyAdminPort))
+	} else {
+		port, ok := portmaps[strconv.Itoa(envoyAdminPort)+"/tcp"]
+		if !ok {
+			return fmt.Errorf("envoy admin port %d not found, got %v", envoyAdminPort, portmaps)
+		}
+		authority = net.JoinHostPort("127.0.0.1", port)
+	}
+
+	httpClient := http.DefaultClient
+	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, timeout, true, func(ctx context.Context) (done bool, err error) {
+		// iptables port forwarding on localhost only works for IPv4
+		resp, err := httpClient.Get(fmt.Sprintf("http://%s/ready", authority))
+		if err != nil {
+			klog.V(2).Infof("unexpected error trying to get load balancer %s readiness :%v", name, err)
 			return false, nil
 		}
 		defer resp.Body.Close()
@@ -333,7 +416,7 @@ func waitLoadBalancerReady(ctx context.Context, name string, timeout time.Durati
 
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
-			klog.V(2).Infof("unexpected error trying to get load balancer %s readyness :%v", name, err)
+			klog.V(2).Infof("unexpected error trying to get load balancer %s readiness :%v", name, err)
 			return false, nil
 		}
 

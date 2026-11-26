@@ -1,12 +1,63 @@
 package loadbalancer
 
 import (
+	"reflect"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/cloud-provider-kind/pkg/constants"
 )
+
+func TestListenAddressForService(t *testing.T) {
+	tests := []struct {
+		name     string
+		service  *v1.Service
+		expected string
+	}{
+		{
+			name:     "no IPFamilies set",
+			service:  &v1.Service{},
+			expected: "",
+		},
+		{
+			name: "IPv4-only service",
+			service: &v1.Service{
+				Spec: v1.ServiceSpec{
+					IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
+				},
+			},
+			expected: "0.0.0.0",
+		},
+		{
+			name: "IPv6-only service",
+			service: &v1.Service{
+				Spec: v1.ServiceSpec{
+					IPFamilies: []v1.IPFamily{v1.IPv6Protocol},
+				},
+			},
+			expected: "::",
+		},
+		{
+			name: "dual-stack service",
+			service: &v1.Service{
+				Spec: v1.ServiceSpec{
+					IPFamilies: []v1.IPFamily{v1.IPv4Protocol, v1.IPv6Protocol},
+				},
+			},
+			expected: "",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			actual := listenAddressForService(test.service)
+			if actual != test.expected {
+				t.Errorf("expected %q, got %q", test.expected, actual)
+			}
+		})
+	}
+}
 
 func TestLoadBalancerName(t *testing.T) {
 	tests := []struct {
@@ -20,8 +71,8 @@ func TestLoadBalancerName(t *testing.T) {
 			name:        "simple",
 			cluster:     "test-cluster",
 			service:     &v1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "test-namespace", Name: "test-service"}},
-			expected:    constants.ContainerPrefix + "-CGVXJAVBASN2Z3RXOABMYVHNP7WNHR3ATSDVOTEN",
-			expectedLen: 48,
+			expected:    constants.ContainerPrefix + "-11ab7482a104",
+			expectedLen: 20,
 		},
 	}
 
@@ -33,6 +84,90 @@ func TestLoadBalancerName(t *testing.T) {
 			}
 			if len(actual) != test.expectedLen {
 				t.Errorf("expected length %d, got %d", test.expectedLen, len(actual))
+			}
+		})
+	}
+}
+
+func TestMissingPublishedPorts(t *testing.T) {
+	service := &v1.Service{
+		Spec: v1.ServiceSpec{
+			Ports: []v1.ServicePort{
+				{Port: 443, Protocol: v1.ProtocolTCP},
+				{Port: 8443, Protocol: v1.ProtocolTCP},
+				{Port: 53, Protocol: v1.ProtocolUDP},
+				{Port: 9999, Protocol: v1.ProtocolSCTP},
+			},
+		},
+	}
+	tests := []struct {
+		name     string
+		portmaps map[string]string
+		expected []string
+	}{
+		{
+			name:     "all ports published",
+			portmaps: map[string]string{"443/tcp": "40001", "8443/tcp": "40002", "53/udp": "40003", "10000/tcp": "40004"},
+			expected: nil,
+		},
+		{
+			name:     "port added after creation",
+			portmaps: map[string]string{"443/tcp": "40001", "53/udp": "40003", "10000/tcp": "40004"},
+			expected: []string{"8443/tcp"},
+		},
+		{
+			name:     "same port number with a different protocol",
+			portmaps: map[string]string{"443/tcp": "40001", "8443/tcp": "40002", "53/tcp": "40003"},
+			expected: []string{"53/udp"},
+		},
+		{
+			name:     "nothing published",
+			portmaps: map[string]string{},
+			expected: []string{"443/tcp", "8443/tcp", "53/udp"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			actual := missingPublishedPorts(service, test.portmaps)
+			if !reflect.DeepEqual(actual, test.expected) {
+				t.Errorf("expected %v, got %v", test.expected, actual)
+			}
+		})
+	}
+}
+
+func TestPublishArg(t *testing.T) {
+	tests := []struct {
+		name          string
+		listenAddress string
+		port          v1.ServicePort
+		expected      string
+	}{
+		{
+			name:          "IPv4 TCP port is published on the same host port",
+			listenAddress: "0.0.0.0",
+			port:          v1.ServicePort{Port: 80, Protocol: v1.ProtocolTCP},
+			expected:      "--publish=0.0.0.0:80:80/TCP",
+		},
+		{
+			name:          "IPv6 UDP port is published on the same host port",
+			listenAddress: "::",
+			port:          v1.ServicePort{Port: 53, Protocol: v1.ProtocolUDP},
+			expected:      "--publish=[::]:53:53/UDP",
+		},
+		{
+			name:          "without listen address the port is published on all addresses",
+			listenAddress: "",
+			port:          v1.ServicePort{Port: 443, Protocol: v1.ProtocolTCP},
+			expected:      "--publish=443:443/TCP",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			actual := publishArg(test.listenAddress, test.port)
+			if actual != test.expected {
+				t.Errorf("expected %q, got %q", test.expected, actual)
 			}
 		})
 	}

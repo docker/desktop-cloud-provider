@@ -15,3 +15,8 @@
 # vendor/
 bin/
 dist/
+
+# macOS
+.DS_Store
+_artifacts/
+_artifacts-*/
