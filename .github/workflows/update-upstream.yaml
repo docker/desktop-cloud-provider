@@ -1,0 +1,307 @@
+# Keep this fork in sync with the latest stable release of
+# kubernetes-sigs/cloud-provider-kind.
+#
+# Daily (or on demand), the workflow looks at the upstream tags, picks the
+# highest stable one (vX.Y.Z, no pre-release) and checks whether its commit is
+# already in the history of the default branch. If not, it merges the tag into
+# an `upstream-sync/<tag>` branch, refreshes vendor/, and opens a PR. When the
+# ci workflow passes on that branch, the PR is merged with a merge commit (never
+# squash/rebase) so that the upstream tag stays an ancestor of the default
+# branch and the next run sees it as already integrated.
+#
+# Cases that need a human:
+#  - merge conflict: nothing is pushed and the run fails. Merge the tag by hand
+#    into a branch named `upstream-sync/<tag>`, pushed to THIS repository (not a
+#    fork), and open a PR from it (as a draft until it is ready): the next run
+#    picks it up, runs ci on it and merges it. A PR from a fork on that branch
+#    name is left alone by the workflow. Conflicts are expected to be the norm
+#    rather than the exception (go.mod, go.sum and the Dockerfile are modified on
+#    both sides).
+#  - ci failure: the PR stays open. Fix the branch; the next run retries.
+#  - PR merged by hand with squash/rebase: the tag is not an ancestor of the
+#    default branch, the run fails. Merge the tag again with a merge commit.
+#  - to skip a tag, close its PR (or convert it to draft to put it on hold).
+#
+# Upstream tags are deliberately NOT fetched into refs/tags: this fork pushes
+# its own v* release tags (see publish.yaml) that share the upstream naming.
+name: update-upstream
+
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: update-upstream
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_URL: https://github.com/kubernetes-sigs/cloud-provider-kind.git
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      pr: ${{ steps.select.outputs.pr || steps.pr.outputs.pr }}
+      head: ${{ steps.select.outputs.head || steps.pr.outputs.head }}
+    env:
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          # The write token must not sit in .git/config while `make update`
+          # runs the merged Makefile. It is only handed to the steps that talk
+          # to GitHub, through the gh credential helper (GH_TOKEN in the env).
+          persist-credentials: false
+      -
+        name: Configure git credentials
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh auth setup-git
+      -
+        name: Select the latest stable upstream tag
+        id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # No `|| true` around ls-remote: a network error must not look like
+          # "no stable tag found".
+          tags=$(git ls-remote --tags --refs "$UPSTREAM_URL" 'v*')
+          tag=$(sed -n 's|.*refs/tags/||p' <<<"$tags" \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V | tail -n1 || true)
+          if [ -z "$tag" ]; then
+            echo "::error::no stable tag found on $UPSTREAM_URL"
+            exit 1
+          fi
+
+          git fetch --no-tags "$UPSTREAM_URL" "+refs/tags/$tag:refs/upstream-tags/$tag"
+          sha=$(git rev-parse "refs/upstream-tags/$tag^{commit}")
+          branch="upstream-sync/$tag"
+          echo "Latest stable upstream tag: $tag ($sha)"
+
+          if git merge-base --is-ancestor "$sha" HEAD; then
+            echo "$tag is already part of the history of $(git branch --show-current): nothing to do" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "action=none" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # An earlier run (or a human) may already have handled this tag.
+          # Only a same-repo PR targeting the default branch can be resumed (its
+          # head lives in this repository, where ci and the merge can reach it).
+          prs=$(gh pr list --head "$branch" --base "$DEFAULT_BRANCH" --state all \
+            --json number,state,isDraft,isCrossRepository,headRefOid)
+          pr=$(jq -c 'map(select(.isCrossRepository | not)) | .[0] // empty' <<<"$prs")
+          if [ -z "$pr" ] && [ -n "$(jq -r '.[] | select(.isCrossRepository and .state == "OPEN") | .number' <<<"$prs")" ]; then
+            echo "::notice::an open PR from a fork already carries the branch name $branch: left to the human on it (push the branch to this repository to have it merged by the workflow)"
+            echo "action=none" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -n "$pr" ]; then
+            state=$(jq -r .state <<<"$pr")
+            draft=$(jq -r .isDraft <<<"$pr")
+            head=$(jq -r .headRefOid <<<"$pr")
+            if [ "$state" = MERGED ]; then
+              echo "::error::PR for $tag is merged but $tag is not in $DEFAULT_BRANCH: merged with squash/rebase? Merge the tag again with a merge commit"
+              exit 1
+            fi
+            if [ "$state" != OPEN ]; then
+              echo "::warning::PR for $tag is $state: skipped on purpose, left alone"
+              echo "action=none" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [ "$draft" = true ]; then
+              echo "PR for $tag is a draft: on hold" | tee -a "$GITHUB_STEP_SUMMARY"
+              echo "action=none" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            # Never merge something that does not actually contain the tag.
+            git fetch --no-tags origin "$branch"
+            if ! git merge-base --is-ancestor "$sha" "$head"; then
+              echo "::error::open PR for $tag does not contain $sha: not merging it"
+              exit 1
+            fi
+            # The PR is merged on the ci result of its own head: that result
+            # only holds for the merge if the branch is up to date with
+            # $DEFAULT_BRANCH, otherwise a clean but broken merge is possible.
+            if ! git merge-base --is-ancestor HEAD "$head"; then
+              echo "::error::open PR for $tag is behind $DEFAULT_BRANCH: merge $DEFAULT_BRANCH into $branch (the next run will validate it)"
+              exit 1
+            fi
+            echo "Open PR for $tag found: resuming it" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "action=none" >> "$GITHUB_OUTPUT"
+            echo "pr=$(jq -r .number <<<"$pr")" >> "$GITHUB_OUTPUT"
+            echo "head=$head" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "action=merge" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+      -
+        name: Merge the tag
+        if: steps.select.outputs.action == 'merge'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.select.outputs.tag }}
+          SHA: ${{ steps.select.outputs.sha }}
+          BRANCH: ${{ steps.select.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          # A branch left over by a run that failed after pushing: reuse it.
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null; then
+            git fetch --no-tags origin "$BRANCH"
+            if ! git merge-base --is-ancestor "$SHA" "origin/$BRANCH"; then
+              echo "::error::branch $BRANCH exists but does not contain $TAG ($SHA): delete or fix it"
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor HEAD "origin/$BRANCH"; then
+              echo "::error::branch $BRANCH is behind the default branch: delete it or merge the default branch into it"
+              exit 1
+            fi
+            git switch -C "$BRANCH" "origin/$BRANCH"
+            exit 0
+          fi
+
+          git switch -c "$BRANCH"
+          git merge --no-ff --no-commit "$SHA" || true
+          if ! git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+            echo "::error::merge of $TAG could not start"
+            exit 1
+          fi
+
+          # Paths the fork owns, whatever upstream did there:
+          #  - .github: the fork's own CI configuration. This also keeps the push
+          #    within what GITHUB_TOKEN may do: it cannot create or update
+          #    workflow files. GitHub checks the resulting tree, not each pushed
+          #    commit, so upstream commits touching .github are fine as long as
+          #    the merge leaves it identical to the default branch (verified:
+          #    add+restore commits, alone or brought in by a merge, are accepted;
+          #    a commit that keeps a workflow change is refused);
+          #  - vendor: generated, upstream does not vendor. It is rebuilt from
+          #    go.mod by the "Refresh vendor" step.
+          for dir in .github vendor; do
+            git rm -r -q -f --cached --ignore-unmatch -- "$dir"
+            git checkout HEAD -- "$dir"
+            git clean -fdq -- "$dir"
+          done
+
+          conflicts=$(git diff --name-only --diff-filter=U)
+          if [ -n "$conflicts" ]; then
+            {
+              echo "### Merge of upstream $TAG conflicts with the default branch"
+              echo
+              echo "Resolve it by hand on a branch named \`$BRANCH\` pushed to this repository (not a fork), and open a PR from it; the next run will validate and merge it."
+              echo
+              echo "Conflicting files:"
+              echo '```'
+              echo "$conflicts"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::merge of $TAG conflicts: $(echo "$conflicts" | head -n 20 | tr '\n' ' ')"
+            exit 1
+          fi
+
+          git commit -s -F - <<EOF2
+          Merge upstream tag $TAG
+
+          Merge kubernetes-sigs/cloud-provider-kind $TAG ($SHA).
+          The .github directory is owned by this fork and left untouched, vendor/ is regenerated from go.mod.
+          EOF2
+      -
+        name: Set up Go
+        if: steps.select.outputs.action == 'merge'
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      -
+        name: Refresh vendor
+        if: steps.select.outputs.action == 'merge'
+        env:
+          TAG: ${{ steps.select.outputs.tag }}
+        run: |
+          set -euo pipefail
+          make update
+          if [ -n "$(git status --porcelain)" ]; then
+            git add go.mod go.sum vendor
+            git commit -s -m "Refresh go.mod and vendor after merging upstream $TAG"
+          fi
+      -
+        name: Push and open the PR
+        id: pr
+        if: steps.select.outputs.action == 'merge'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.select.outputs.tag }}
+          SHA: ${{ steps.select.outputs.sha }}
+          BRANCH: ${{ steps.select.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git push origin "$BRANCH"
+
+          cat > "$RUNNER_TEMP/body.md" <<EOF2
+          ## What this PR does, in one sentence
+
+          Brings the upstream release [$TAG](https://github.com/kubernetes-sigs/cloud-provider-kind/releases/tag/$TAG) ($SHA) into this fork.
+
+          ## Context
+
+          This fork follows kubernetes-sigs/cloud-provider-kind. The \`update-upstream\` workflow looks for the latest stable upstream tag every day and opens this PR when that tag is not yet in the history of \`$DEFAULT_BRANCH\`.
+
+          ## What the PR brings
+
+          - the upstream tag merged as-is, with \`go.mod\`/\`vendor/\` refreshed in a separate commit when needed;
+          - the fork's own \`.github\` directory is kept untouched, and \`vendor/\` is regenerated from \`go.mod\`.
+
+          The PR is merged by the workflow, with a merge commit so the tag stays in the branch ancestry, as soon as the \`ci\` job of that run is green. If it fails, the PR stays open for manual follow-up; close it to skip this tag, or convert it to draft to put it on hold.
+          EOF2
+
+          gh pr create --base "$DEFAULT_BRANCH" --head "$BRANCH" \
+            --title "Merge upstream $TAG" --body-file "$RUNNER_TEMP/body.md"
+          pr=$(gh pr view "$BRANCH" --json number,headRefOid)
+          echo "pr=$(jq -r .number <<<"$pr")" >> "$GITHUB_OUTPUT"
+          echo "head=$(jq -r .headRefOid <<<"$pr")" >> "$GITHUB_OUTPUT"
+
+  ci:
+    needs: prepare
+    if: needs.prepare.outputs.pr != ''
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yaml
+    with:
+      ref: ${{ needs.prepare.outputs.head }}
+
+  merge:
+    needs: [prepare, ci]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      PR: ${{ needs.prepare.outputs.pr }}
+      HEAD: ${{ needs.prepare.outputs.head }}
+    steps:
+      -
+        # Merge commit on purpose (no squash, no rebase): the upstream tag must
+        # remain in the ancestry of the default branch. --match-head-commit
+        # guarantees that what lands is exactly what ci validated.
+        name: Merge the PR
+        run: gh pr merge "$PR" --merge --delete-branch --match-head-commit "$HEAD"
