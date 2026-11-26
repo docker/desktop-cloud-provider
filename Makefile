@@ -24,7 +24,7 @@ test:
 	CGO_ENABLED=1 go test -v -race -count 1 ./...
 
 e2e:
-	cd tests && bats tests.bats
+	bats tests/
 
 # code linters
 lint:
@@ -34,16 +34,29 @@ update:
 	go mod tidy && go mod vendor
 
 # get image name from directory we're building
-IMAGE_NAME=cloud-provider-kind
+IMAGE_NAME?=cloud-provider-kind
 # docker image registry, default to upstream
 REGISTRY?=gcr.io/k8s-staging-kind
 # tag based on date-sha
 TAG?=$(shell echo "$$(date +v%Y%m%d)-$$(git describe --always --dirty)")
 # the full image tag
-IMAGE?=$(REGISTRY)/$(IMAGE_NAME):$(TAG)
+CPK_IMAGE?=$(REGISTRY)/$(IMAGE_NAME):$(TAG)
+PLATFORMS?=linux/amd64,linux/arm64
 
-# required to enable buildx
-export DOCKER_CLI_EXPERIMENTAL=enabled
+.PHONY: ensure-buildx
+ensure-buildx:
+	./hack/init-buildx.sh
+
 image-build:
-# docker buildx build --platform=${PLATFORMS} $(OUTPUT) --progress=$(PROGRESS) -t ${IMAGE} --pull $(EXTRA_BUILD_OPT) .
-	docker build . -t ${IMAGE}
+	docker buildx build . \
+		--tag="${CPK_IMAGE}" \
+		--load
+
+image-push:
+	docker buildx build . \
+		--platform="${PLATFORMS}" \
+		--tag="${CPK_IMAGE}" \
+		--push
+
+.PHONY: release # Build a multi-arch docker image
+release: ensure-buildx image-push

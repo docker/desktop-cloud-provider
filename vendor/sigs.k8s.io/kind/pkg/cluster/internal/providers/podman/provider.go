@@ -9,7 +9,7 @@ You may obtain a copy of the License at
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or impliep.
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
@@ -31,7 +31,6 @@ import (
 	"sigs.k8s.io/kind/pkg/exec"
 	"sigs.k8s.io/kind/pkg/log"
 
-	internallogs "sigs.k8s.io/kind/pkg/cluster/internal/logs"
 	"sigs.k8s.io/kind/pkg/cluster/internal/providers"
 	"sigs.k8s.io/kind/pkg/cluster/internal/providers/common"
 	"sigs.k8s.io/kind/pkg/internal/apis/config"
@@ -102,13 +101,30 @@ func (p *provider) Provision(status *cli.Status, cfg *config.Cluster) (err error
 
 // ListClusters is part of the providers.Provider interface
 func (p *provider) ListClusters() ([]string, error) {
+	// Select the format specifier for extracting the cluster label.
+	// podman 6.0.0 changed `.Labels` from a map to a slice, breaking the
+	// `index .Labels "key"` form; the `.Label "key"` specifier works on
+	// podman 5.0.0+ and across that change, but does not exist on older
+	// versions. See https://github.com/kubernetes-sigs/kind/issues/4201
+	v, err := getPodmanVersion()
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to check podman version")
+	}
+
+	var format string
+	if v.AtLeast(version.MustParseSemantic(labelFormatVersion)) {
+		format = fmt.Sprintf(`{{.Label "%s"}}`, clusterLabelKey)
+	} else {
+		format = fmt.Sprintf(`{{index .Labels "%s"}}`, clusterLabelKey)
+	}
+
 	cmd := exec.Command("podman",
 		"ps",
 		"-a", // show stopped nodes
 		// filter for nodes with the cluster label
 		"--filter", "label="+clusterLabelKey,
 		// format to include the cluster name
-		"--format", fmt.Sprintf(`{{index .Labels "%s"}}`, clusterLabelKey),
+		"--format", format,
 	)
 	lines, err := exec.OutputLines(cmd)
 	if err != nil {
@@ -171,6 +187,15 @@ func (p *provider) DeleteNodes(n []nodes.Node) error {
 	return deleteVolumes(nodeVolumes)
 }
 
+// getHostIPOrDefault defaults HostIP to localhost if is not set
+// xref: https://github.com/kubernetes-sigs/kind/issues/3777
+func getHostIPOrDefault(hostIP string) string {
+	if hostIP == "" {
+		return "127.0.0.1"
+	}
+	return hostIP
+}
+
 // GetAPIServerEndpoint is part of the providers.Provider interface
 func (p *provider) GetAPIServerEndpoint(cluster string) (string, error) {
 	// locate the node that hosts this
@@ -193,7 +218,7 @@ func (p *provider) GetAPIServerEndpoint(cluster string) (string, error) {
 	// https://github.com/containers/podman/issues/8444
 	if v.AtLeast(version.MustParseSemantic("2.2.0")) &&
 		v.LessThan(version.MustParseSemantic("3.0.0")) {
-		p.logger.Warnf("WARNING: podman version %s not fully supported, please use versions 3.0.0+")
+		p.logger.Warnf("WARNING: podman version %s not fully supported, please use versions 3.0.0+", v)
 
 		cmd := exec.Command(
 			"podman", "inspect",
@@ -266,7 +291,7 @@ func (p *provider) GetAPIServerEndpoint(cluster string) (string, error) {
 			}
 			for _, pm := range v {
 				if containerPort == common.APIServerInternalPort && protocol == "tcp" {
-					return net.JoinHostPort(pm.HostIP, pm.HostPort), nil
+					return net.JoinHostPort(getHostIPOrDefault(pm.HostIP), pm.HostPort), nil
 				}
 			}
 		}
@@ -278,7 +303,7 @@ func (p *provider) GetAPIServerEndpoint(cluster string) (string, error) {
 	}
 	for _, pm := range portMappings19 {
 		if pm.ContainerPort == common.APIServerInternalPort && pm.Protocol == "tcp" {
-			return net.JoinHostPort(pm.HostIP, strconv.Itoa(int(pm.HostPort))), nil
+			return net.JoinHostPort(getHostIPOrDefault(pm.HostIP), strconv.Itoa(int(pm.HostPort))), nil
 		}
 	}
 
@@ -327,33 +352,17 @@ func (p *provider) CollectLogs(dir string, nodes []nodes.Node) error {
 			filepath.Join(dir, "podman-info.txt"),
 		),
 	}
-
-	// collect /var/log for each node and plan collecting more logs
-	var errs []error
+	// inspect each node
 	for _, n := range nodes {
 		node := n // https://golang.org/doc/faq#closures_and_goroutines
 		name := node.String()
 		path := filepath.Join(dir, name)
-		if err := internallogs.DumpDir(p.logger, node, "/var/log", path); err != nil {
-			errs = append(errs, err)
-		}
-
 		fns = append(fns,
-			func() error { return common.CollectLogs(node, path) },
 			execToPathFn(exec.Command("podman", "inspect", name), filepath.Join(path, "inspect.json")),
-			func() error {
-				f, err := common.FileOnHost(filepath.Join(path, "serial.log"))
-				if err != nil {
-					return err
-				}
-				return node.SerialLogs(f)
-			},
 		)
 	}
-
 	// run and collect up all errors
-	errs = append(errs, errors.AggregateConcurrent(fns))
-	return errors.NewAggregate(errs)
+	return errors.AggregateConcurrent(fns)
 }
 
 // Info returns the provider info.

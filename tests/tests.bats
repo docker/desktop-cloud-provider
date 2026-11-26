@@ -1,75 +1,406 @@
 #!/usr/bin/env bats
 
-setup_file() {
-    REPO_ROOT="$( cd "$(dirname "$BATS_TEST_FILENAME")/.." >/dev/null 2>&1 && pwd )"
-    cd $REPO_ROOT
-    # install cloud-provider-kind
-    make
-    TMP_DIR=$(mktemp -d)
-    export TMP_DIR
-    # install `kind` and `kubectl` to tempdir
-    curl -sLo "${TMP_DIR}/kubectl" "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-    chmod +x "${TMP_DIR}/kubectl"
-    curl -sLo "${TMP_DIR}/kind" https://kind.sigs.k8s.io/dl/latest/kind-linux-amd64
-    chmod +x "${TMP_DIR}/kind"
-
-    PATH="${TMP_DIR}:${PATH}"
-    export PATH
-    # create cluster
-    kind create cluster --name kccm --wait 1m
-    kind get kubeconfig --name kccm > "${TMP_DIR}/kubeconfig"
-    kubectl --kubeconfig "${TMP_DIR}/kubeconfig" wait --for=condition=ready pods --namespace=kube-system -l k8s-app=kube-dns --timeout=3m
-    kubectl --kubeconfig "${TMP_DIR}/kubeconfig" label node kccm-control-plane node.kubernetes.io/exclude-from-external-load-balancers-
-    # run cloud-provider-kind
-    nohup bin/cloud-provider-kind  > ${TMP_DIR}/kccm-kind.log 2>&1 &
-    CLOUD_PROVIDER_KIND_PID=$(echo $!)
-}
-
-teardown_file() {
-    kill -9 ${CLOUD_PROVIDER_KIND_PID}
-    kind delete cluster --name kccm || true
-
-    if [[ -n "${TMP_DIR:-}" ]]; then
-        rm -rf "${TMP_DIR}"
-    fi
-}
-
 @test "ExternalTrafficPolicy: Local" {
-    kubectl --kubeconfig "${TMP_DIR}/kubeconfig" apply -f examples/loadbalancer_etp_local.yaml
-    kubectl --kubeconfig "${TMP_DIR}/kubeconfig" wait --for=condition=ready pods -l app=MyLocalApp
+    kubectl apply -f "$BATS_TEST_DIRNAME"/../examples/loadbalancer_etp_local.yaml
+    kubectl wait --for=condition=ready pods -l app=MyLocalApp
     for i in {1..5}
     do
-        IP=$(kubectl --kubeconfig "${TMP_DIR}/kubeconfig" get services lb-service-local --output jsonpath='{.status.loadBalancer.ingress[0].ip}')
+        IP=$(kubectl get services lb-service-local --output jsonpath='{.status.loadBalancer.ingress[0].ip}')
         [[ ! -z "$IP" ]] && break || sleep 1
     done
-    echo $IP
-    POD=$(kubectl --kubeconfig "${TMP_DIR}/kubeconfig" get pod -l app=MyLocalApp -o jsonpath='{.items[0].metadata.name}')
-    echo $POD
+    echo "IP: $IP"
+    POD=$(kubectl get pod -l app=MyLocalApp -o jsonpath='{.items[0].metadata.name}')
+    echo "Pod $POD"
     for i in {1..5}
     do
         HOSTNAME=$(curl -s http://${IP}:80/hostname || true)
         [[ ! -z "$HOSTNAME" ]] && break || sleep 1
     done
-    echo $HOSTNAME
+    echo "Hostname via TCP: $HOSTNAME"
     [  "$HOSTNAME" = "$POD" ]
+    kubectl delete -f "$BATS_TEST_DIRNAME"/../examples/loadbalancer_etp_local.yaml
 }
 
 @test "ExternalTrafficPolicy: Cluster" {
-    kubectl --kubeconfig "${TMP_DIR}/kubeconfig" apply -f examples/loadbalancer_etp_cluster.yaml
-    kubectl --kubeconfig "${TMP_DIR}/kubeconfig" wait --for=condition=ready pods -l app=MyClusterApp
+    kubectl apply -f "$BATS_TEST_DIRNAME"/../examples/loadbalancer_etp_cluster.yaml
+    kubectl wait --for=condition=ready pods -l app=MyClusterApp
     for i in {1..5}
     do
-        IP=$(kubectl --kubeconfig "${TMP_DIR}/kubeconfig" get services lb-service-cluster --output jsonpath='{.status.loadBalancer.ingress[0].ip}')
+        IP=$(kubectl get services lb-service-cluster --output jsonpath='{.status.loadBalancer.ingress[0].ip}')
         [[ ! -z "$IP" ]] && break || sleep 1
     done
-    echo $IP
-    POD=$(kubectl --kubeconfig "${TMP_DIR}/kubeconfig" get pod -l app=MyClusterApp -o jsonpath='{.items[0].metadata.name}')
-    echo $POD
+    echo "IP: $IP"
+    POD=$(kubectl get pod -l app=MyClusterApp -o jsonpath='{.items[0].metadata.name}')
+    echo "Pod $POD"
     for i in {1..5}
     do
         HOSTNAME=$(curl -s http://${IP}:80/hostname || true)
         [[ ! -z "$HOSTNAME" ]] && break || sleep 1
     done
-    echo $HOSTNAME
+    echo "Hostname via TCP: $HOSTNAME"
     [  "$HOSTNAME" = "$POD" ]
+    kubectl delete -f "$BATS_TEST_DIRNAME"/../examples/loadbalancer_etp_cluster.yaml
+}
+
+@test "Multiple Protocols: UDP and TCP" {
+    kubectl apply -f "$BATS_TEST_DIRNAME"/../examples/loadbalancer_udp_tcp.yaml
+    kubectl wait --for=condition=ready pods -l app=multiprotocol
+    for i in {1..5}
+    do
+        IP=$(kubectl get services multiprotocol --output jsonpath='{.status.loadBalancer.ingress[0].ip}')
+        [[ ! -z "$IP" ]] && break || sleep 1
+    done
+    echo "IP: $IP"
+    POD=$(kubectl get pod -l app=multiprotocol -o jsonpath='{.items[0].metadata.name}')
+    echo "Pod $POD"
+    for i in {1..5}
+    do
+        HOSTNAME=$(curl -s http://${IP}:80/hostname || true)
+        [[ ! -z "$HOSTNAME" ]] && break || sleep 1
+    done
+    echo "Hostname via TCP: $HOSTNAME"
+    [  "$HOSTNAME" = "$POD" ]
+
+    for i in {1..5}
+    do
+        HOSTNAME=$(echo hostname | nc -u -w 3 ${IP} 80 || true)
+        [[ ! -z "$HOSTNAME" ]] && break || sleep 1
+    done
+    echo "Hostname via UDP: $HOSTNAME"
+    [[ ! -z "$HOSTNAME" ]] && [  "$HOSTNAME" = "$POD" ]
+    kubectl delete -f "$BATS_TEST_DIRNAME"/../examples/loadbalancer_udp_tcp.yaml
+}
+
+@test "Ingress to Gateway Migration and X-Forwarded-For Header" {
+    # Apply the Gateway and HTTPRoute manifests
+    kubectl apply -f "$BATS_TEST_DIRNAME"/../examples/ingress_foo_bar.yaml
+
+    # Wait for the backend application pod to be ready
+    kubectl wait --for=condition=ready pods -l app=foo --timeout=60s
+    kubectl wait --for=condition=ready pods -l app=foo --timeout=60s
+
+    # Give the controller time to reconcile
+    echo "Waiting for reconciliation..."
+    sleep 5
+
+    echo "Finding Ingress Loadbalancer IP ..."
+    run kubectl get ingress example-ingress -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+    [ "$status" -eq 0 ]
+    export INGRESS_SVC_IP="$output"
+    echo "Ingress LoadBalancer IP: $INGRESS_SVC_IP"
+
+    # Test /foo prefix
+    echo "Testing /foo prefix (should match foo-app)..."
+    run kubectl exec curl-pod -- curl -H "Host: foo.example.com" -s "http://$INGRESS_SVC_IP/hostname"
+    [ "$status" -eq 0 ]
+    [[ "$output" == "foo-app" ]]
+
+    # Test /bar prefix
+    echo "Testing /bar prefix (should match bar-app)..."
+    run kubectl exec curl-pod -- curl  -H "Host: bar.example.com" -s "http://$INGRESS_SVC_IP/hostname"
+    [ "$status" -eq 0 ]
+    [[ "$output" == "bar-app" ]]
+
+    # Test X-Forwarded-For header
+    echo "Testing X-Forwarded-For header..."
+    run kubectl exec curl-pod -- curl -H "Host: foo.example.com" -s "http://$INGRESS_SVC_IP/header?key=X-Forwarded-For"
+    [ "$status" -eq 0 ]
+    echo "X-Forwarded-For header value: $output"
+    [[ ! -z "$output" ]]
+
+    # Cleanup: Delete the applied manifests
+    kubectl delete --ignore-not-found -f "$BATS_TEST_DIRNAME"/../examples/ingress_foo_bar.yaml
+}
+
+@test "Ingress WebSocket Support" {
+    # 1. Deploy a WebSocket-capable echo server
+    cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ws-echo
+  labels:
+    app: ws-echo
+spec:
+  selector:
+    matchLabels:
+      app: ws-echo
+  template:
+    metadata:
+      labels:
+        app: ws-echo
+    spec:
+      containers:
+      - name: echo
+        image: jmalloc/echo-server
+        ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ws-service
+spec:
+  ports:
+  - port: 80
+    targetPort: 8080
+  selector:
+    app: ws-echo
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ws-ingress
+spec:
+  rules:
+  - host: ws.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: ws-service
+            port:
+              number: 80
+EOF
+
+    # 2. Wait for the pod to be ready
+    kubectl wait --for=condition=ready pod -l app=ws-echo --timeout=60s
+
+    # 3. Get Ingress IP
+    echo "Waiting for Ingress IP..."
+    for i in {1..30}; do
+        IP=$(kubectl get ingress ws-ingress -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+        [[ ! -z "$IP" ]] && break || sleep 1
+    done
+    echo "Ingress IP: $IP"
+    [[ ! -z "$IP" ]]
+
+    # 4. Verify WebSocket Upgrade from the HOST (with retry)
+    echo "Verifying WebSocket handshake..."
+    FOUND=0
+    for i in {1..10}; do
+        # Use --max-time 3 to prevent hanging if the IP is not yet reachable
+        OUTPUT=$(curl -i -N -s --max-time 3 \
+            -H "Host: ws.example.com" \
+            -H "Connection: Upgrade" \
+            -H "Upgrade: websocket" \
+            -H "Sec-WebSocket-Key: SGVsbG8sIHdvcmxkIQ==" \
+            -H "Sec-WebSocket-Version: 13" \
+            "http://$IP/" || true)
+        
+        if [[ "$OUTPUT" == *"101 Switching Protocols"* ]]; then
+            echo "Success: 101 Switching Protocols found"
+            FOUND=1
+            break
+        fi
+        echo "Attempt $i failed or not ready. Retrying..."
+        sleep 1
+    done
+
+    if [ "$FOUND" -eq 0 ]; then
+        echo "Failed to establish WebSocket connection. Last output:"
+        echo "$OUTPUT"
+        return 1
+    fi
+
+    # Cleanup
+    kubectl delete deployment ws-echo
+    kubectl delete service ws-service
+    kubectl delete ingress ws-ingress
+}
+
+# https://github.com/kubernetes-sigs/cloud-provider-kind/issues/458
+@test "Multiple single-stack LoadBalancers on the same port with enable-lb-port-mapping" {
+    cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: same-port
+  labels:
+    app: same-port
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: same-port
+  template:
+    metadata:
+      labels:
+        app: same-port
+    spec:
+      containers:
+      - name: agnhost
+        image: registry.k8s.io/e2e-test-images/agnhost:2.66.1
+        args:
+          - netexec
+          - --http-port=8080
+        ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: same-port-1
+spec:
+  type: LoadBalancer
+  ipFamilyPolicy: SingleStack
+  ipFamilies:
+  - IPv4
+  selector:
+    app: same-port
+  ports:
+  - protocol: TCP
+    port: 9090
+    targetPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: same-port-2
+spec:
+  type: LoadBalancer
+  ipFamilyPolicy: SingleStack
+  ipFamilies:
+  - IPv4
+  selector:
+    app: same-port
+  ports:
+  - protocol: TCP
+    port: 9090
+    targetPort: 8080
+EOF
+    kubectl wait --for=condition=ready pods -l app=same-port --timeout=60s
+    POD=$(kubectl get pod -l app=same-port -o jsonpath='{.items[0].metadata.name}')
+    echo "Pod $POD"
+
+    for svc in same-port-1 same-port-2
+    do
+        IP=""
+        for i in {1..30}
+        do
+            IP=$(kubectl get services $svc --output jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            [[ ! -z "$IP" ]] && break || sleep 1
+        done
+        echo "$svc IP: $IP"
+        [[ ! -z "$IP" ]]
+
+        HOSTNAME=""
+        for i in {1..10}
+        do
+            HOSTNAME=$(curl -s --max-time 3 http://${IP}:9090/hostname || true)
+            [[ ! -z "$HOSTNAME" ]] && break || sleep 1
+        done
+        echo "$svc hostname via TCP: $HOSTNAME"
+        [ "$HOSTNAME" = "$POD" ]
+    done
+
+    kubectl delete service same-port-1 same-port-2
+    kubectl delete deployment same-port
+}
+
+@test "LoadBalancer serves a port added after creation with enable-lb-port-mapping" {
+    cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: port-added
+  labels:
+    app: port-added
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: port-added
+  template:
+    metadata:
+      labels:
+        app: port-added
+    spec:
+      containers:
+      - name: agnhost
+        image: registry.k8s.io/e2e-test-images/agnhost:2.66.1
+        args:
+          - netexec
+          - --http-port=8080
+        ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: port-added
+spec:
+  type: LoadBalancer
+  selector:
+    app: port-added
+  ports:
+  - name: first
+    protocol: TCP
+    port: 7070
+    targetPort: 8080
+EOF
+    kubectl wait --for=condition=ready pods -l app=port-added --timeout=60s
+    POD=$(kubectl get pod -l app=port-added -o jsonpath='{.items[0].metadata.name}')
+    echo "Pod $POD"
+
+    IP=""
+    for i in {1..30}
+    do
+        IP=$(kubectl get services port-added --output jsonpath='{.status.loadBalancer.ingress[0].ip}')
+        [[ ! -z "$IP" ]] && break || sleep 1
+    done
+    echo "IP: $IP"
+    [[ ! -z "$IP" ]]
+
+    HOSTNAME=""
+    for i in {1..10}
+    do
+        HOSTNAME=$(curl -s --max-time 3 http://${IP}:7070/hostname || true)
+        [[ ! -z "$HOSTNAME" ]] && break || sleep 1
+    done
+    echo "Hostname via port 7070: $HOSTNAME"
+    [ "$HOSTNAME" = "$POD" ]
+
+    # Add a port to the existing Service, the running LoadBalancer has to forward it too
+    kubectl patch service port-added --type=json \
+        -p='[{"op": "add", "path": "/spec/ports/-", "value": {"name": "second", "protocol": "TCP", "port": 7071, "targetPort": 8080}}]'
+
+    # The LoadBalancer IP is reachable directly on Linux, so also check the port published
+    # on the host, which is what the tunnels and port mapping depend on.
+    HOST_PORT=""
+    for i in {1..30}
+    do
+        CONTAINER=$(docker ps -q --filter "label=io.x-k8s.cloud-provider-kind.loadbalancer.name=${CLUSTER_NAME}/default/port-added")
+        HOST_PORT=$(docker port "$CONTAINER" 7071/tcp 2>/dev/null | head -n 1 | sed 's/.*://' || true)
+        [[ ! -z "$HOST_PORT" ]] && break || sleep 1
+    done
+    echo "Host port for 7071: $HOST_PORT"
+    [[ ! -z "$HOST_PORT" ]]
+
+    HOSTNAME=""
+    for i in {1..30}
+    do
+        HOSTNAME=$(curl -s --max-time 3 http://127.0.0.1:${HOST_PORT}/hostname || true)
+        [[ ! -z "$HOSTNAME" ]] && break || sleep 1
+    done
+    echo "Hostname via host port $HOST_PORT: $HOSTNAME"
+    [ "$HOSTNAME" = "$POD" ]
+
+    HOSTNAME=""
+    for i in {1..30}
+    do
+        HOSTNAME=$(curl -s --max-time 3 http://${IP}:7071/hostname || true)
+        [[ ! -z "$HOSTNAME" ]] && break || sleep 1
+    done
+    echo "Hostname via port 7071: $HOSTNAME"
+    [ "$HOSTNAME" = "$POD" ]
+
+    NEW_IP=$(kubectl get services port-added --output jsonpath='{.status.loadBalancer.ingress[0].ip}')
+    echo "IP after adding a port: $NEW_IP"
+    [ "$NEW_IP" = "$IP" ]
+
+    kubectl delete service port-added
+    kubectl delete deployment port-added
 }

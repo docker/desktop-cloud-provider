@@ -3,42 +3,58 @@ package loadbalancer
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/base32"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	cloudprovider "k8s.io/cloud-provider"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/keymutex"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/cloud-provider-kind/pkg/config"
 	"sigs.k8s.io/cloud-provider-kind/pkg/constants"
 	"sigs.k8s.io/cloud-provider-kind/pkg/container"
+	"sigs.k8s.io/cloud-provider-kind/pkg/tunnels"
 )
 
 type Server struct {
+	tunnelManager *tunnels.TunnelManager
+	// the service controller syncs Services and Nodes from different workers,
+	// so the methods below can be called concurrently for the same load balancer
+	locks keymutex.KeyMutex
 }
 
 var _ cloudprovider.LoadBalancer = &Server{}
 
 func NewServer() cloudprovider.LoadBalancer {
-	return &Server{}
+	s := &Server{
+		locks: keymutex.NewHashed(0),
+	}
+
+	if config.DefaultConfig.LoadBalancerConnectivity == config.Tunnel {
+		s.tunnelManager = tunnels.NewTunnelManager()
+	}
+	return s
 }
 
 func (s *Server) GetLoadBalancer(ctx context.Context, clusterName string, service *v1.Service) (*v1.LoadBalancerStatus, bool, error) {
 	// report status
 	name := loadBalancerName(clusterName, service)
-	ipv4, ipv6, err := container.IPs(name)
+	info, err := container.Inspect(name)
 	if err != nil {
-		if strings.Contains(err.Error(), "failed to get container details") {
+		if errors.Is(err, container.ErrNotFound) {
 			return nil, false, nil
 		}
 		return nil, false, err
 	}
+	ipv4, ipv6 := info.IPv4, info.IPv6
 	status := &v1.LoadBalancerStatus{}
 
 	// process Ports
@@ -85,22 +101,56 @@ func (s *Server) GetLoadBalancerName(ctx context.Context, clusterName string, se
 
 func (s *Server) EnsureLoadBalancer(ctx context.Context, clusterName string, service *v1.Service, nodes []*v1.Node) (*v1.LoadBalancerStatus, error) {
 	name := loadBalancerName(clusterName, service)
-	if !container.IsRunning(name) {
-		klog.Infof("container %s for loadbalancer is not running", name)
-		if container.Exist(name) {
-			err := container.Delete(name)
-			if err != nil {
+	s.locks.LockKey(name)
+	defer s.locks.UnlockKey(name) // nolint: errcheck
+
+	// Decide from one snapshot of the container: the runtime restart policy changes
+	// the state concurrently, and piecewise reads can mix two states and delete a
+	// container that is about to come back.
+	var ipv4, ipv6 string
+	create := false
+	info, err := container.Inspect(name)
+	switch {
+	case errors.Is(err, container.ErrNotFound):
+		create = true
+	case err != nil:
+		return nil, err
+	case info.Status == "restarting":
+		// the runtime reports no addresses or ports until it is back, retry later
+		return nil, fmt.Errorf("container %s for loadbalancer is restarting", name)
+	case !info.Running():
+		klog.Infof("container %s for loadbalancer is %s", name, info.Status)
+		if err := s.deleteLoadBalancer(name); err != nil {
+			return nil, err
+		}
+		create = true
+	case s.forwardsPortsToHost():
+		// The published ports of a container can not be changed once it is created, so if
+		// the Service gained ports the container has to be recreated to forward them.
+		// Keep the current IPs so the LoadBalancer address does not change.
+		if missing := missingPublishedPorts(service, info.Ports); len(missing) > 0 {
+			klog.Infof("recreating container %s for loadbalancer, ports %v are not published", name, missing)
+			ipv4, ipv6 = info.IPv4, info.IPv6
+			if err := s.deleteLoadBalancer(name); err != nil {
 				return nil, err
 			}
+			create = true
 		}
 	}
-	if !container.Exist(name) {
+
+	if create {
 		klog.V(2).Infof("creating container for loadbalancer")
-		image := proxyImage
-		if env, ok := os.LookupEnv("PROXY_IMAGE"); ok {
-			image = env
+		err := s.createLoadBalancer(clusterName, service, config.DefaultConfig.ProxyImage, ipv4, ipv6)
+		if err != nil && (ipv4 != "" || ipv6 != "") {
+			klog.Infof("failed to recreate container %s with addresses %q %q, retrying without them: %v", name, ipv4, ipv6, err)
+			// The runtime may leave the container created but not started when the address is in use.
+			if container.Exist(name) {
+				if delErr := container.Delete(name); delErr != nil {
+					return nil, errors.Join(err, delErr)
+				}
+			}
+			err = s.createLoadBalancer(clusterName, service, config.DefaultConfig.ProxyImage, "", "")
 		}
-		err := s.createLoadBalancer(clusterName, service, image)
 		if err != nil {
 			return nil, err
 		}
@@ -108,9 +158,18 @@ func (s *Server) EnsureLoadBalancer(ctx context.Context, clusterName string, ser
 
 	// update loadbalancer
 	klog.V(2).Infof("updating loadbalancer")
-	err := s.UpdateLoadBalancer(ctx, clusterName, service, nodes)
+	err = proxyUpdateLoadBalancer(ctx, clusterName, service, nodes)
 	if err != nil {
 		return nil, err
+	}
+
+	// on some platforms that run containers in VMs forward from userspace
+	if s.tunnelManager != nil {
+		klog.V(2).Infof("updating loadbalancer tunnels on userspace")
+		err = s.tunnelManager.SetupTunnels(loadBalancerName(clusterName, service))
+		if err != nil {
+			klog.ErrorS(err, "error setting up tunnels")
+		}
 	}
 
 	// get loadbalancer Status
@@ -126,12 +185,20 @@ func (s *Server) EnsureLoadBalancer(ctx context.Context, clusterName string, ser
 }
 
 func (s *Server) UpdateLoadBalancer(ctx context.Context, clusterName string, service *v1.Service, nodes []*v1.Node) error {
+	name := loadBalancerName(clusterName, service)
+	s.locks.LockKey(name)
+	defer s.locks.UnlockKey(name) // nolint: errcheck
 	return proxyUpdateLoadBalancer(ctx, clusterName, service, nodes)
 }
 
 func (s *Server) EnsureLoadBalancerDeleted(ctx context.Context, clusterName string, service *v1.Service) error {
 	containerName := loadBalancerName(clusterName, service)
+	s.locks.LockKey(containerName)
+	defer s.locks.UnlockKey(containerName) // nolint: errcheck
 	var err1, err2 error
+	if s.tunnelManager != nil {
+		err1 = s.tunnelManager.RemoveTunnels(containerName)
+	}
 	// Before deleting the load balancer store the logs if required
 	if config.DefaultConfig.EnableLogDump {
 		fileName := path.Join(config.DefaultConfig.LogDir, service.Namespace+"_"+service.Name+".log")
@@ -144,13 +211,26 @@ func (s *Server) EnsureLoadBalancerDeleted(ctx context.Context, clusterName stri
 	return errors.Join(err1, err2)
 }
 
+// deleteLoadBalancer removes the container before recreating it. The tunnels are
+// removed too, the new container publishes different host ports.
+func (s *Server) deleteLoadBalancer(containerName string) error {
+	if s.tunnelManager != nil {
+		if err := s.tunnelManager.RemoveTunnels(containerName); err != nil {
+			klog.ErrorS(err, "error removing tunnels", "container", containerName)
+		}
+	}
+	return container.Delete(containerName)
+}
+
 // loadbalancer name is a unique name for the loadbalancer container
 func loadBalancerName(clusterName string, service *v1.Service) string {
-	hash := sha256.Sum256([]byte(loadBalancerSimpleName(clusterName, service)))
-	encoded := base32.StdEncoding.EncodeToString(hash[:])
-	name := constants.ContainerPrefix + "-" + encoded[:40]
-
-	return name
+	h := sha256.New()
+	_, err := io.WriteString(h, loadBalancerSimpleName(clusterName, service))
+	if err != nil {
+		panic(err)
+	}
+	hash := h.Sum(nil)
+	return fmt.Sprintf("%s-%x", constants.ContainerPrefix, hash[:6])
 }
 
 func loadBalancerSimpleName(clusterName string, service *v1.Service) string {
@@ -167,8 +247,31 @@ func ServiceFromLoadBalancerSimpleName(s string) (clusterName string, service *v
 	return
 }
 
-// createLoadBalancer create a docker container with a loadbalancer
-func (s *Server) createLoadBalancer(clusterName string, service *v1.Service, image string) error {
+// forwardsPortsToHost returns true if the Service ports are published on the host.
+func (s *Server) forwardsPortsToHost() bool {
+	return s.tunnelManager != nil || config.DefaultConfig.LoadBalancerConnectivity == config.Portmap
+}
+
+// missingPublishedPorts returns the TCP and UDP Service ports, in port/protocol
+// format, that are not published by the container according to its portmaps.
+func missingPublishedPorts(service *v1.Service, portmaps map[string]string) []string {
+	var missing []string
+	for _, port := range service.Spec.Ports {
+		if port.Protocol != v1.ProtocolTCP && port.Protocol != v1.ProtocolUDP {
+			continue
+		}
+		key := fmt.Sprintf("%d/%s", port.Port, strings.ToLower(string(port.Protocol)))
+		if _, ok := portmaps[key]; !ok {
+			missing = append(missing, key)
+		}
+	}
+	return missing
+}
+
+// createLoadBalancer create a docker container with a loadbalancer.
+// ipv4 and ipv6, if not empty, are the addresses to assign to the container
+// when the Service does not specify a LoadBalancerIP.
+func (s *Server) createLoadBalancer(clusterName string, service *v1.Service, image string, ipv4, ipv6 string) error {
 	name := loadBalancerName(clusterName, service)
 
 	networkName := constants.FixedNetworkName
@@ -183,27 +286,41 @@ func (s *Server) createLoadBalancer(clusterName string, service *v1.Service, ima
 		"--label", fmt.Sprintf("%s=%s", constants.NodeCCMLabelKey, clusterName),
 		// label the node with the load balancer name
 		"--label", fmt.Sprintf("%s=%s", constants.LoadBalancerNameLabelKey, loadBalancerSimpleName(clusterName, service)),
-		// label container as Docker Desktop kub-system namespace
+		// label container as Docker Desktop kube-system namespace
 		"--label", "io.kubernetes.pod.namespace=kube-system",
 		// user a user defined docker network so we get embedded DNS
 		"--net", networkName,
 		"--init=false",
+		"--stop-signal=SIGKILL",
 		"--hostname", name, // make hostname match container name
 		"--restart=on-failure", // to deal with the crash casued by https://github.com/envoyproxy/envoy/issues/34195
 	}
 
-	// Forward the Service Ports to the host so they are accessible on Mac and Windows
-	for _, port := range service.Spec.Ports {
-		if port.Protocol != v1.ProtocolTCP && port.Protocol != v1.ProtocolUDP {
-			continue
-		}
-
-		for _, family := range service.Spec.IPFamilies {
-			hostIP := "0.0.0.0"
-			if family == v1.IPv6Protocol {
-				hostIP = "[::]"
+	if s.forwardsPortsToHost() {
+		// Forward the Service Ports to the host so they are accessible on Mac and Windows.
+		// For single IP-family services, explicitly bind on the matching listen address to avoid
+		// dual-stack host bindings that cause connection resets in environments where IPv6 is
+		// advertised but not functional end-to-end (e.g. some GitHub Actions runners).
+		// For dual-stack or unspecified services, publish without an explicit address.
+		// See https://github.com/kubernetes-sigs/cloud-provider-kind/issues/387
+		// Docker Desktop: the host port is the Service port so the Service is reachable on localhost.
+		listenAddress := listenAddressForService(service)
+		for _, port := range service.Spec.Ports {
+			if port.Protocol != v1.ProtocolTCP && port.Protocol != v1.ProtocolUDP {
+				continue
 			}
-			args = append(args, fmt.Sprintf("--publish=%s:%d:%d/%s", hostIP, port.Port, port.Port, port.Protocol))
+			args = append(args, publishArg(listenAddress, port))
+		}
+	}
+
+	if service.Spec.LoadBalancerIP != "" {
+		args = append(args, "--ip", service.Spec.LoadBalancerIP)
+	} else {
+		if ipv4 != "" {
+			args = append(args, "--ip", ipv4)
+		}
+		if ipv6 != "" {
+			args = append(args, "--ip6", ipv6)
 		}
 	}
 
@@ -225,4 +342,37 @@ func (s *Server) createLoadBalancer(clusterName string, service *v1.Service, ima
 	}
 
 	return nil
+}
+
+// publishArg returns the flag publishing the Service port on the host, using the same host port.
+func publishArg(listenAddress string, port v1.ServicePort) string {
+	if listenAddress == "" {
+		return fmt.Sprintf("--publish=%d:%d/%s", port.Port, port.Port, port.Protocol)
+	}
+	hostAddr := net.JoinHostPort(listenAddress, strconv.Itoa(int(port.Port)))
+	return fmt.Sprintf("--publish=%s:%d/%s", hostAddr, port.Port, port.Protocol)
+}
+
+// listenAddressForService returns the host listen address to use when publishing
+// ports for a service. For single IP-family services it returns the corresponding
+// wildcard address ("0.0.0.0" or "::") so that Docker does not create spurious
+// dual-stack bindings. For dual-stack or unspecified services it returns "" so
+// the caller falls back to publishing without an explicit address.
+func listenAddressForService(service *v1.Service) string {
+	var hasIPv4, hasIPv6 bool
+	for _, family := range service.Spec.IPFamilies {
+		switch family {
+		case v1.IPv4Protocol:
+			hasIPv4 = true
+		case v1.IPv6Protocol:
+			hasIPv6 = true
+		}
+	}
+	if hasIPv4 && !hasIPv6 {
+		return "0.0.0.0"
+	}
+	if hasIPv6 && !hasIPv4 {
+		return "::"
+	}
+	return ""
 }

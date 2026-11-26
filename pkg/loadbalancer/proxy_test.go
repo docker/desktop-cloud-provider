@@ -1,7 +1,10 @@
 package loadbalancer
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -298,14 +301,18 @@ func Test_generateConfig(t *testing.T) {
 					},
 				},
 				SourceRanges: []sourceRange{
-					{ Prefix: "10.0.0.0", Length: 8},
-					{ Prefix: "192.168.0.0", Length: 16},
+					{Prefix: "10.0.0.0", Length: 8},
+					{Prefix: "192.168.0.0", Length: 16},
 				},
 			},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			if tt.want != nil {
+				tt.want.Service = tt.service
+				tt.want.Nodes = tt.nodes
+			}
 			if got := generateConfig(tt.service, tt.nodes); !reflect.DeepEqual(got, tt.want) {
 				t.Logf("diff %+v", cmp.Diff(got, tt.want))
 				t.Errorf("generateConfig() = %+v,\n want %+v", got, tt.want)
@@ -341,15 +348,19 @@ func Test_proxyConfig(t *testing.T) {
 				resources:
 				- "@type": type.googleapis.com/envoy.config.cluster.v3.Cluster
 				  name: cluster_IPv4_443
-				  connect_timeout: 5s
+				  connect_timeout: 3s
 				  type: STATIC
+				  common_lb_config:
+				    healthy_panic_threshold:
+				      value: 0
 				  lb_policy: RANDOM
 				  health_checks:
-				  - timeout: 5s
-				    interval: 3s
+				  - timeout: 3s
+				    interval: 2s
 				    unhealthy_threshold: 2
 				    healthy_threshold: 1
-				    no_traffic_interval: 5s
+				    initial_jitter: 0s
+				    no_traffic_interval: 3s
 				    always_log_health_check_failures: true
 				    always_log_health_check_success: true
 				    event_log_path: /dev/stdout
@@ -378,15 +389,19 @@ func Test_proxyConfig(t *testing.T) {
 				                protocol: TCP
 				- "@type": type.googleapis.com/envoy.config.cluster.v3.Cluster
 				  name: cluster_IPv4_80
-				  connect_timeout: 5s
+				  connect_timeout: 3s
 				  type: STATIC
+				  common_lb_config:
+				    healthy_panic_threshold:
+				      value: 0
 				  lb_policy: RANDOM
 				  health_checks:
-				  - timeout: 5s
-				    interval: 3s
+				  - timeout: 3s
+				    interval: 2s
 				    unhealthy_threshold: 2
 				    healthy_threshold: 1
-				    no_traffic_interval: 5s
+				    initial_jitter: 0s
+				    no_traffic_interval: 3s
 				    always_log_health_check_failures: true
 				    always_log_health_check_success: true
 				    event_log_path: /dev/stdout
@@ -488,15 +503,19 @@ func Test_proxyConfig(t *testing.T) {
 				resources:
 				- "@type": type.googleapis.com/envoy.config.cluster.v3.Cluster
 				  name: cluster_IPv4_80
-				  connect_timeout: 5s
+				  connect_timeout: 3s
 				  type: STATIC
+				  common_lb_config:
+				    healthy_panic_threshold:
+				      value: 0
 				  lb_policy: RING_HASH
 				  health_checks:
-				  - timeout: 5s
-				    interval: 3s
+				  - timeout: 3s
+				    interval: 2s
 				    unhealthy_threshold: 2
 				    healthy_threshold: 1
-				    no_traffic_interval: 5s
+				    initial_jitter: 0s
+				    no_traffic_interval: 3s
 				    always_log_health_check_failures: true
 				    always_log_health_check_success: true
 				    event_log_path: /dev/stdout
@@ -574,8 +593,8 @@ func Test_proxyConfig(t *testing.T) {
 					},
 				},
 				SourceRanges: []sourceRange{
-					{ Prefix: "10.0.0.0", Length: 8},
-					{ Prefix: "192.168.0.0", Length: 16},
+					{Prefix: "10.0.0.0", Length: 8},
+					{Prefix: "192.168.0.0", Length: 16},
 				},
 			},
 			wantConfig: `
@@ -618,6 +637,101 @@ func Test_proxyConfig(t *testing.T) {
 			if gotConfig != wantConfig {
 				t.Logf("%s", gotConfig)
 				t.Errorf("proxyConfig() not expected\n%v", cmp.Diff(gotConfig, wantConfig))
+			}
+		})
+	}
+}
+
+func Test_loadTemplate(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, CDSTemplateFile), []byte("custom"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name    string
+		dir     string
+		file    string
+		want    string
+		wantErr bool
+	}{
+		{name: "no dir uses builtin", dir: "", file: CDSTemplateFile, want: "builtin"},
+		{name: "missing file uses builtin", dir: dir, file: LDSTemplateFile, want: "builtin"},
+		{name: "existing file overrides", dir: dir, file: CDSTemplateFile, want: "custom"},
+		{name: "unreadable path errors", dir: filepath.Join(dir, CDSTemplateFile), file: CDSTemplateFile, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := loadTemplate(tt.dir, tt.file, "builtin")
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("loadTemplate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Errorf("loadTemplate() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_DumpDefaultTemplates(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "templates")
+	if err := DumpDefaultTemplates(dir); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]string{LDSTemplateFile: proxyLDSConfigTemplate, CDSTemplateFile: proxyCDSConfigTemplate} {
+		got, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != want {
+			t.Errorf("%s does not match the built-in template", name)
+		}
+	}
+}
+
+// The example template is user facing, keep it rendering against proxyConfigData.
+func Test_proxyProtocolExampleTemplate(t *testing.T) {
+	tmpl, err := os.ReadFile(filepath.Join("..", "..", "examples", "loadbalancer-templates", "proxy-protocol", CDSTemplateFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := makeService("test")
+	service.Spec.Type = v1.ServiceTypeLoadBalancer
+	service.Spec.IPFamilies = []v1.IPFamily{v1.IPv4Protocol}
+	service.Spec.Ports[0].Protocol = v1.ProtocolTCP
+	service.Spec.Ports[0].NodePort = 30000
+	nodes := []*v1.Node{makeNode("a", "10.0.0.1")}
+
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		wantProxy   bool
+	}{
+		{name: "no annotations"},
+		{name: "annotation false", annotations: map[string]string{"example.com/proxy-protocol": "false"}},
+		{name: "annotation true", annotations: map[string]string{"example.com/proxy-protocol": "true"}, wantProxy: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := service.DeepCopy()
+			svc.Annotations = tt.annotations
+			got, err := proxyConfig(string(tmpl), generateConfig(svc, nodes))
+			if err != nil {
+				t.Fatalf("proxyConfig() error = %v", err)
+			}
+			gotProxy := strings.Contains(got, "envoy.transport_sockets.upstream_proxy_protocol")
+			if gotProxy != tt.wantProxy {
+				t.Errorf("proxy protocol rendered = %v, want %v\n%s", gotProxy, tt.wantProxy, got)
+			}
+			if !tt.wantProxy {
+				// without the annotation the example must match the built-in template
+				want, err := proxyConfig(proxyCDSConfigTemplate, generateConfig(svc, nodes))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got != want {
+					t.Errorf("example template differs from built-in\n%v", cmp.Diff(got, want))
+				}
 			}
 		})
 	}

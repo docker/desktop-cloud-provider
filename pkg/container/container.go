@@ -2,6 +2,7 @@ package container
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -15,33 +16,143 @@ import (
 // TODO we can do it as in KIND
 var containerRuntime = "docker"
 
-// dockerIsAvailable checks if docker is available in the system
-func dockerIsAvailable() bool {
-	cmd := kindexec.Command("docker", "-v")
-	lines, err := kindexec.OutputLines(cmd)
-	if err != nil || len(lines) != 1 {
-		return false
+// ErrNotFound is returned by Inspect when the container does not exist.
+var ErrNotFound = errors.New("container not found")
+
+// Info is the subset of the container state used to reconcile it, read in one inspect call.
+type Info struct {
+	// Status is the runtime state: running, restarting, exited, created, paused, ...
+	Status string
+	IPv4   string
+	IPv6   string
+	// Ports maps the published container ports, in port/protocol format, to the host port.
+	Ports map[string]string
+}
+
+// Running reports if the container is up. A restarting container is not running:
+// the runtime is in control and reports no addresses or ports for it.
+func (i *Info) Running() bool {
+	return i.Status == "running"
+}
+
+// Inspect returns a consistent snapshot of the container state.
+// It returns ErrNotFound if the container can not be inspected, the
+// error message differs between runtimes.
+func Inspect(name string) (*Info, error) {
+	cmd := kindexec.Command(containerRuntime, "inspect", name)
+	output, err := kindexec.Output(cmd)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s: %v", ErrNotFound, name, err)
 	}
-	return strings.HasPrefix(lines[0], "Docker version")
+	return parseInspect(output)
+}
+
+func parseInspect(data []byte) (*Info, error) {
+	var containers []struct {
+		State struct {
+			Status string `json:"Status"`
+		} `json:"State"`
+		NetworkSettings struct {
+			Ports    map[string][]portMapping `json:"Ports"`
+			Networks map[string]struct {
+				IPAddress         string `json:"IPAddress"`
+				GlobalIPv6Address string `json:"GlobalIPv6Address"`
+			} `json:"Networks"`
+		} `json:"NetworkSettings"`
+	}
+	if err := json.Unmarshal(data, &containers); err != nil {
+		return nil, fmt.Errorf("failed to parse container details: %w", err)
+	}
+	if len(containers) != 1 {
+		return nil, fmt.Errorf("expected 1 container, got %d", len(containers))
+	}
+	c := containers[0]
+	info := &Info{
+		Status: c.State.Status,
+		Ports:  parsePortMappings(c.NetworkSettings.Ports),
+	}
+	for _, network := range c.NetworkSettings.Networks {
+		if info.IPv4 == "" {
+			info.IPv4 = network.IPAddress
+		}
+		if info.IPv6 == "" {
+			info.IPv6 = network.GlobalIPv6Address
+		}
+	}
+	return info, nil
+}
+
+// dockerIsAvailable checks if docker is available and the daemon is running
+func dockerIsAvailable() bool {
+	cmd := kindexec.Command("docker", "info")
+	_, err := kindexec.OutputLines(cmd)
+	return err == nil
 }
 
 func podmanIsAvailable() bool {
-	cmd := kindexec.Command("podman", "-v")
-	lines, err := kindexec.OutputLines(cmd)
-	if err != nil || len(lines) != 1 {
-		return false
-	}
-	return strings.HasPrefix(lines[0], "podman version")
-
+	cmd := kindexec.Command("podman", "info")
+	_, err := kindexec.OutputLines(cmd)
+	return err == nil
 }
 
-func init() {
+func nerdctlIsAvailable() bool {
+	cmd := kindexec.Command("nerdctl", "info")
+	if _, err := kindexec.OutputLines(cmd); err == nil {
+		return true
+	}
+	cmd = kindexec.Command("finch", "info")
+	_, err := kindexec.OutputLines(cmd)
+	return err == nil
+}
+
+// Runtime returns the detected container runtime name.
+func Runtime() string {
+	return containerRuntime
+}
+
+// SetRuntime overrides the auto-detected container runtime.
+func SetRuntime(name string) {
+	containerRuntime = name
+}
+
+// DetectRootless returns true if rootless mode is detected, false otherwise
+func DetectRootless() (bool, error) {
+	var fstr = ""
+	switch containerRuntime {
+	case "docker":
+		fstr = "{{range $opt := .SecurityOptions}}{{ if eq $opt \"name=rootless\" }}{{\"true\"}}{{end}}{{end}}"
+	case "podman":
+		fstr = "{{.Host.Security.Rootless}}"
+	}
+	if fstr == "" {
+		return false, fmt.Errorf("unable to determine rootless for provider %s, assuming false", containerRuntime)
+	}
+	cmd := kindexec.Command(containerRuntime, "info", "-f", fstr)
+	result, err := kindexec.OutputLines(cmd)
+	if err != nil || len(result) == 0 {
+		return false, err
+	}
+	return result[0] == "true", nil
+}
+
+// DetectRuntime probes the system for an available container runtime.
+// It returns an error if no supported runtime is installed and running.
+func DetectRuntime() (string, error) {
 	if dockerIsAvailable() {
-		return
+		return "docker", nil
 	}
 	if podmanIsAvailable() {
-		containerRuntime = "podman"
+		return "podman", nil
 	}
+	if nerdctlIsAvailable() {
+		if _, err := exec.LookPath("nerdctl"); err != nil {
+			if _, err := exec.LookPath("finch"); err == nil {
+				return "finch", nil
+			}
+		}
+		return "nerdctl", nil
+	}
+	return "", fmt.Errorf("no supported container runtime found")
 }
 
 func Logs(name string, w io.Writer) error {
@@ -91,8 +202,7 @@ func Delete(name string) error {
 }
 
 func IsRunning(name string) bool {
-	cmd := exec.Command(containerRuntime, []string{"ps", "-q", "--filter", "label=io.kubernetes.pod.namespace=kube-system",
-		"-f", "name=" + name}...)
+	cmd := exec.Command(containerRuntime, []string{"ps", "-q", "-f", "name=" + name}...)
 	output, err := cmd.Output()
 	if err != nil || len(output) == 0 {
 		return false
@@ -166,17 +276,22 @@ func PortMaps(name string) (map[string]string, error) {
 		return nil, fmt.Errorf("file should only be one line, got %d lines: %w", len(lines), err)
 	}
 
-	type portMapping struct {
-		HostPort string `json:"HostPort"`
-		HostIP   string `json:"HostIp"`
-	}
-
 	portMappings := make(map[string][]portMapping)
 	err = json.Unmarshal([]byte(lines[0]), &portMappings)
 	if err != nil {
 		return nil, err
 	}
+	return parsePortMappings(portMappings), nil
+}
 
+type portMapping struct {
+	HostPort string `json:"HostPort"`
+	HostIP   string `json:"HostIp"`
+}
+
+// parsePortMappings returns the map of the published TCP and UDP container ports,
+// in port/protocol format, to the host port.
+func parsePortMappings(portMappings map[string][]portMapping) map[string]string {
 	result := map[string]string{}
 	for k, v := range portMappings {
 		protocol := "tcp"
@@ -192,12 +307,12 @@ func PortMaps(name string) (map[string]string, error) {
 		// TODO we just can get the first entry or look for ip families
 		for _, pm := range v {
 			if pm.HostPort != "" {
-				result[parts[0]] = pm.HostPort
+				result[parts[0]+"/"+protocol] = pm.HostPort
 				break
 			}
 		}
 	}
-	return result, nil
+	return result
 }
 
 func ListByLabel(label string) ([]string, error) {
