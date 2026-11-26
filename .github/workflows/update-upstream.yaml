@@ -46,6 +46,7 @@ jobs:
       head: ${{ steps.select.outputs.head || steps.pr.outputs.head }}
     env:
       GH_TOKEN: ${{ github.token }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
     steps:
       -
         name: Checkout
@@ -62,7 +63,7 @@ jobs:
           tag=$(git ls-remote --tags --refs "$UPSTREAM_URL" 'v*' \
             | sed -n 's|.*refs/tags/||p' \
             | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
-            | sort -V | tail -n1)
+            | sort -V | tail -n1 || true)
           if [ -z "$tag" ]; then
             echo "::error::no stable tag found on $UPSTREAM_URL"
             exit 1
@@ -80,20 +81,35 @@ jobs:
           fi
 
           # An earlier run (or a human) may already have handled this tag.
-          pr=$(gh pr list --head "$branch" --state all \
-            --json number,state,isDraft,headRefOid --jq '.[0] // empty')
+          # Only a same-repo PR targeting the default branch counts: a fork PR
+          # may carry the same branch name.
+          pr=$(gh pr list --head "$branch" --base "$DEFAULT_BRANCH" --state all \
+            --json number,state,isDraft,isCrossRepository,headRefOid \
+            --jq 'map(select(.isCrossRepository | not)) | .[0] // empty')
           if [ -n "$pr" ]; then
             state=$(jq -r .state <<<"$pr")
             draft=$(jq -r .isDraft <<<"$pr")
-            if [ "$state" != OPEN ] || [ "$draft" = true ]; then
-              echo "PR for $tag is $state (draft: $draft): left alone" | tee -a "$GITHUB_STEP_SUMMARY"
+            head=$(jq -r .headRefOid <<<"$pr")
+            if [ "$state" != OPEN ]; then
+              echo "::warning::PR for $tag is $state but $tag is not in $DEFAULT_BRANCH: left alone (merged with squash/rebase, or skipped on purpose?)"
               echo "action=none" >> "$GITHUB_OUTPUT"
               exit 0
+            fi
+            if [ "$draft" = true ]; then
+              echo "PR for $tag is a draft: on hold" | tee -a "$GITHUB_STEP_SUMMARY"
+              echo "action=none" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            # Never merge something that does not actually contain the tag.
+            git fetch --no-tags origin "$branch"
+            if ! git merge-base --is-ancestor "$sha" "$head"; then
+              echo "::error::open PR for $tag does not contain $sha: not merging it"
+              exit 1
             fi
             echo "Open PR for $tag found: resuming it" | tee -a "$GITHUB_STEP_SUMMARY"
             echo "action=none" >> "$GITHUB_OUTPUT"
             echo "pr=$(jq -r .number <<<"$pr")" >> "$GITHUB_OUTPUT"
-            echo "head=$(jq -r .headRefOid <<<"$pr")" >> "$GITHUB_OUTPUT"
+            echo "head=$head" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -115,7 +131,11 @@ jobs:
 
           # A branch left over by a run that failed after pushing: reuse it.
           if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null; then
-            git fetch origin "$BRANCH"
+            git fetch --no-tags origin "$BRANCH"
+            if ! git merge-base --is-ancestor "$SHA" "origin/$BRANCH"; then
+              echo "::error::branch $BRANCH exists but does not contain $TAG ($SHA): delete or fix it"
+              exit 1
+            fi
             git switch -C "$BRANCH" "origin/$BRANCH"
             exit 0
           fi
@@ -175,7 +195,7 @@ jobs:
           set -euo pipefail
           make update
           if [ -n "$(git status --porcelain)" ]; then
-            git add -A
+            git add go.mod go.sum vendor
             git commit -s -m "Refresh go.mod and vendor after merging upstream $TAG"
           fi
       -
@@ -197,7 +217,7 @@ jobs:
 
           ## Context
 
-          This fork follows kubernetes-sigs/cloud-provider-kind. The \`update-upstream\` workflow looks for the latest stable upstream tag every day and opens this PR when that tag is not yet in the history of \`${{ github.event.repository.default_branch }}\`.
+          This fork follows kubernetes-sigs/cloud-provider-kind. The \`update-upstream\` workflow looks for the latest stable upstream tag every day and opens this PR when that tag is not yet in the history of \`$DEFAULT_BRANCH\`.
 
           ## What the PR brings
 
@@ -209,7 +229,7 @@ jobs:
           🤖 Generated with [Claude Code](https://claude.com/claude-code)
           EOF2
 
-          gh pr create --base "${{ github.event.repository.default_branch }}" --head "$BRANCH" \
+          gh pr create --base "$DEFAULT_BRANCH" --head "$BRANCH" \
             --title "Merge upstream $TAG" --body-file "$RUNNER_TEMP/body.md"
           pr=$(gh pr view "$BRANCH" --json number,headRefOid)
           echo "pr=$(jq -r .number <<<"$pr")" >> "$GITHUB_OUTPUT"
