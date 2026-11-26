@@ -1,0 +1,58 @@
+# Build and test the code. Runs on every PR and push to main, and is also
+# called by update-upstream.yaml to validate an upstream merge before it lands.
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref or SHA to check out (defaults to the triggering ref)
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      -
+        name: Set up Go
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      -
+        name: Build
+        run: go build ./...
+      -
+        name: Vet
+        run: go vet ./...
+      -
+        name: Test
+        run: make test
+
+  # The release image is built from the Dockerfile: make sure it still builds
+  # (e.g. its Go toolchain is recent enough for go.mod).
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      -
+        name: Build image
+        run: docker build .
